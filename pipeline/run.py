@@ -6,7 +6,8 @@ Inputs: command line arguments and the files under ``<data_dir>/raw``.
 Outputs: raw files when they were missing, Parquet files under ``<data_dir>/staging`` and
     ``<data_dir>/marts``, and one log line per stage.
 
-Only the generate stage is implemented; the other stages log that they are not implemented yet.
+The generate and ingest stages are implemented (ingest runs its own quality assertions); the
+transform and quality stages log that they are not implemented yet.
 """
 
 import argparse
@@ -16,6 +17,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from data_gen.generate import RAW_FILES, GeneratorConfig, generate
+from pipeline.ingest import ingest
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,7 @@ def run_pipeline(data_dir: Path, generator_config: GeneratorConfig | None = None
 
     Raises:
         ValueError: If the generator configuration is invalid.
+        DataQualityError: If a data quality assertion fails.
     """
     raw_dir = data_dir / "raw"
     missing = [name for name in RAW_FILES if not (raw_dir / name).exists()]
@@ -46,7 +49,11 @@ def run_pipeline(data_dir: Path, generator_config: GeneratorConfig | None = None
     else:
         logger.info("stage=generate status=skipped reason=raw_data_present")
 
-    for stage in STAGES[1:]:
+    logger.info("stage=ingest status=started")
+    ingest(raw_dir, data_dir / "staging")
+    logger.info("stage=ingest status=done")
+
+    for stage in STAGES[2:]:
         logger.info("stage=%s status=skipped reason=not_implemented", stage)
     logger.info("pipeline finished stages=%d", len(STAGES))
 

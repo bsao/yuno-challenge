@@ -44,4 +44,4 @@ make check
 
 ## Status
 
-The synthetic generator works and is wired into the runner (`make pipeline` generates raw data when it is missing); ingest, transform, quality and the dashboard views are stubs.
+Generation and ingestion work (`make pipeline` writes `data/staging/transactions.parquet`); transform, the standalone quality stage and the dashboard views are stubs.

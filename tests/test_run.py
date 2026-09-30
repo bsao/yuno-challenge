@@ -14,7 +14,8 @@ import pytest
 from data_gen.generate import RAW_FILES, GeneratorConfig
 from pipeline.run import STAGES, run_pipeline
 
-SMALL = GeneratorConfig(n_transactions=500)
+# Large enough for the status mix guardrails to hold with a wide margin.
+SMALL = GeneratorConfig(n_transactions=5_000)
 
 
 def _logged_stages(caplog: pytest.LogCaptureFixture) -> list[tuple[str, str]]:
@@ -35,9 +36,10 @@ def test_generates_raw_data_when_missing(tmp_path: Path, caplog: pytest.LogCaptu
 
     for name in RAW_FILES:
         assert (tmp_path / "raw" / name).is_file()
+    assert (tmp_path / "staging" / "transactions.parquet").is_file()
     assert _logged_stages(caplog) == [
         ("generate", "done"),
-        ("ingest", "skipped"),
+        ("ingest", "done"),
         ("transform", "skipped"),
         ("quality", "skipped"),
     ]
@@ -52,7 +54,7 @@ def test_skips_generation_when_raw_data_exists(
     before = (webhooks.stat().st_mtime_ns, webhooks.read_bytes())
 
     with caplog.at_level(logging.INFO, logger="pipeline.run"):
-        run_pipeline(tmp_path, GeneratorConfig(n_transactions=900, seed=7))
+        run_pipeline(tmp_path, GeneratorConfig(n_transactions=9_000, seed=7))
 
     assert (webhooks.stat().st_mtime_ns, webhooks.read_bytes()) == before
     assert _logged_stages(caplog)[0] == ("generate", "skipped")

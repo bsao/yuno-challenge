@@ -68,3 +68,49 @@ holds 122. Small segments need real volume to be readable.
 
 Trade off: a full scale run takes about 2 seconds but peaks at about 1.5 GB of memory and writes a
 780 MB raw file, which can exhaust a Docker VM limited to 2 GB.
+
+## D6. Ingestion: deduplication and latest status
+
+`pipeline/ingest.py` writes `data/staging/transactions.parquet`, grain: one row per
+`transaction_id`.
+
+- **Deduplication**: deliveries that share an `event_id` are identical retries; the first arrival
+  is kept.
+- **Latest event wins by event time**: the winner has the highest `event_at`. Arrival order is
+  ignored, so a `pending` event delivered after the final status cannot overwrite it. Ties on
+  `event_at` break on the lifecycle rank of the status (pending < approved, declined, failed,
+  expired < refunded), then on `event_id`, so the result is deterministic.
+- **Idempotency by full refresh**: every run rebuilds staging from the whole raw file, so replayed
+  or reordered deliveries give the same output (tested). In production this becomes an incremental
+  merge keyed on `transaction_id` that applies the same ordering rule; the rule, not the refresh
+  strategy, is what guarantees correctness.
+- **Columns**: `transaction_id`, `merchant_id`, `country`, `currency`, `amount_minor`,
+  `payment_method`, `card_brand`, `psp`, `final_status`, `decline_reason`, `created_at` and
+  `updated_at` (UTC), `n_events`, `amount_usd`, `created_at_local`, `local_hour`, `local_weekday`.
+- **Money**: `amount_minor` stays an integer in the currency's minor unit. `amount_usd` is
+  `amount_minor / 10 ** exponent * rate`, with exponents MXN 2, COP 2, CLP 0 and fixed,
+  illustrative rates (1 MXN = 0.054 USD, 1 COP = 0.00025 USD, 1 CLP = 0.00105 USD). These are not
+  market rates; `amount_usd` exists only so cross country views can be summed.
+- **Local time**: `created_at` is converted with the IANA zone of the country (America/Mexico_City,
+  America/Bogota, America/Santiago). `created_at_local` is stored without a zone because one
+  column cannot hold several; `local_weekday` is ISO (1 Monday to 7 Sunday). Transactions are
+  bucketed by creation time, not by their last update.
+- **Out of order count**: an event is out of order when it arrives after a later event (by
+  `event_at`) of the same transaction. This is lower than the number of delayed deliveries the
+  generator reports, because a delayed event that is not overtaken stays in order.
+- **Trade off**: the stage collects the deduplicated events in memory. At full scale the pipeline
+  run peaks at about 2.3 GB. A streaming sink or the incremental merge removes that ceiling.
+
+## D7. Quality assertions on staging
+
+`pipeline/quality.py` raises `DataQualityError` and nothing is written when a check fails:
+duplicate `transaction_id`; values outside the vocabularies (null allowed only for `card_brand` and
+`decline_reason`); null, zero or negative amounts; status mix outside guardrails; and row count
+reconciliation between raw and staging.
+
+- **Status mix guardrails** (share of transactions): approved 55% to 90%, declined 8% to 30%,
+  failed 0.5% to 8%, expired up to 10%, pending up to 5%, refunded up to 5%. They are wide on
+  purpose: they catch a broken batch, not normal variation or a planted anomaly.
+- **Reconciliation identities**: `raw rows - duplicates == distinct event_id == sum of n_events in
+  staging`, and `distinct transaction_id in raw == staging rows`. The raw counts come from a
+  separate aggregation of the raw file, independent of the deduplication path.

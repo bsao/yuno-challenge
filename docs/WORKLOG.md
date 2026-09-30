@@ -140,3 +140,55 @@ Planted anomalies, ground truth against what the re-read measures:
 | a) PSP_C, Colombia, cards, 2026-09-01 to 2026-09-03 | decline rate doubles | 321 of 848 (37.9%) | 2,301 of 11,981 (19.2%) |
 | b) Merchant `mrc_037`, OXXO | about 95% expiration | 4,539 of 4,730 (96.0%) | 26,455 of 74,557 (35.5%) |
 | c) PSP_B, Mexico, 02:00 to 04:00, 2026-09-12 and 13 | network_timeout spike | 78 of 122 (63.9%) | 65 of 4,938 (1.3%) |
+
+## Step 3: ingestion and quality assertions
+
+Proposed commit: `feat(pipeline): ingest webhooks into staging with quality assertions`
+
+**Delivered**
+- `pipeline/ingest.py`: reads `webhooks.jsonl` lazily with an explicit schema, removes duplicate
+  deliveries, keeps the latest event per transaction, derives `amount_usd` and local time, and
+  writes `data/staging/transactions.parquet`.
+- `pipeline/quality.py`: five assertions that raise `DataQualityError`.
+- `pipeline/run.py`: the ingest stage is wired in after generate.
+- Tests: 6 for ingestion (tiny in memory fixture) and 9 for the quality checks.
+
+**Decisions**: D6 (deduplication, latest status rule, money, local time), D7 (quality assertions).
+
+**Coverage against the step specification**
+
+| Requirement | Status | Evidence |
+|---|---|---|
+| Reads the raw files with Polars | Met for `webhooks.jsonl` | `merchants.csv` and `psp_fees.csv` are not needed for staging and are left for the marts |
+| Writes `data/staging/transactions.parquet`, one row per transaction | Met | 1,200,000 rows, unique key asserted |
+| Latest event wins, duplicates removed | Met | fixture tests: duplicate, out of order, reversed arrival, timestamp tie |
+| `final_status`, `amount_minor`, `amount_usd` | Met | USD values hand computed for MXN, COP and CLP (test) |
+| Local timestamp, local hour and weekday | Met | hand computed for the three zones, including Chile's daylight saving change (test) |
+| Raises on duplicate `transaction_id` | Met | `check_unique` (test) |
+| Raises on invalid enum values | Met | `check_enum_values` (test) |
+| Raises on negative amounts | Met | `check_positive_amounts` also rejects zero and null (test) |
+| Raises on status mix outside expected ranges | Met | `check_status_mix` with the D7 guardrails (test) |
+| Raises on row count reconciliation between raw and staging | Met | `check_row_count_reconciliation` (test) |
+| Logs duplicates and out of order events handled | Met | `duplicates_removed=23814 out_of_order_events_handled=33197` |
+| Pytest tests for deduplication with a tiny in memory fixture | Met | `tests/test_ingest.py`, 12 deliveries across 5 transactions |
+
+**Verification**: `make check` passes (32 tests). Full scale pipeline run (ingest on existing raw
+data): 6.3 seconds, 2.3 GB peak memory.
+
+Double check, staging (Polars, lazy scan of the Parquet file) against a pure Python recomputation
+from the raw file that implements the same ordering rule without Polars:
+
+| Number | Staging (Polars) | Raw re-read (Python) |
+|---|---|---|
+| Deliveries | 2,430,825 (log) | 2,430,825 |
+| Unique events | 2,407,011 | 2,407,011 |
+| Duplicates removed | 23,814 (log) | 23,814 |
+| Out of order events | 33,197 (log) | 33,197 |
+| Transactions | 1,200,000 | 1,200,000 |
+| Approved | 891,334 | 891,334 |
+| Declined | 201,287 | 201,287 |
+| Failed | 35,795 | 35,795 |
+| Expired | 44,383 | 44,383 |
+| Pending | 10,095 | 10,095 |
+| Refunded | 17,106 | 17,106 |
+| Approved amount in USD | 37,425,323.52 | 37,425,323.52 |
