@@ -39,7 +39,7 @@ make check
 - `pipeline/`: ingest (raw to staging), transform (staging to marts), quality, run (orchestrator)
 - `analytics/`: metrics, anomalies, merchant health, PSP cost
 - `app/`: Streamlit dashboard
-- `docs/`: [DECISIONS.md](docs/DECISIONS.md), [ANALYSIS.md](docs/ANALYSIS.md), screenshots
+- `docs/`: [WORKLOG.md](docs/WORKLOG.md) (step by step build trail), [DECISIONS.md](docs/DECISIONS.md), [ANALYSIS.md](docs/ANALYSIS.md), screenshots
 - `data/`: generated at run time, not versioned (`raw/`, `staging/`, `marts/`)
 
 ## Status

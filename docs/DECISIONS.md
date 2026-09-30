@@ -52,3 +52,13 @@ contract is the only interface.
   amex cards decline more.
 - **Trade off**: local time in the generator uses fixed UTC offsets, valid for June to August.
   The pipeline will use IANA time zones, which keeps the two code paths independent.
+
+## D5. Full scale by default
+
+The generator defaults to the real volume (about 1.2 million transactions over 90 days) so the
+numbers a reviewer sees match the brief of 400,000 transactions per month.
+
+Trade off: a full scale run peaks at about 1.7 GB of memory and writes about 805 MB of raw files,
+which can exhaust a Docker VM limited to 2 GB. Reviewers on a small VM can pass `--scale` (for
+example `--scale 0.25`) to shrink the dataset; every rate keeps its sample size and Wilson interval,
+so a smaller run stays honest about its precision.
