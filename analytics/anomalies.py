@@ -29,6 +29,7 @@ Assumptions:
 """
 
 from collections.abc import Sequence
+from typing import Literal
 
 import polars as pl
 
@@ -54,16 +55,17 @@ PEER_MARGIN = 0.10
 # One sided normal quantile for 0.05 / 168: Bonferroni correction for the 7 x 24 heatmap cells.
 HEATMAP_Z = 3.43
 
+MerchantSegment = Literal["merchant_category", "merchant_size_tier"]
 DAILY_SEGMENT: tuple[str, ...] = ("psp", "country", "payment_method")
 HOURLY_SEGMENT: tuple[str, ...] = ("psp", "country")
 PEER_GROUP: tuple[str, ...] = ("country", "merchant_category")
 
 # Upper edges (exclusive) of the USD ticket size buckets; the last bucket is open ended.
-AMOUNT_BUCKET_EDGES_USD: tuple[float, ...] = (10.0, 25.0, 50.0, 100.0, 250.0)
+AMOUNT_BUCKET_EDGES_USD: tuple[float, ...] = (10.0, 20.0, 50.0, 100.0, 250.0)
 AMOUNT_BUCKET_LABELS: tuple[str, ...] = (
     "0-10",
-    "10-25",
-    "25-50",
+    "10-20",
+    "20-50",
     "50-100",
     "100-250",
     "250+",
@@ -173,7 +175,7 @@ def decline_rate_by_amount_bucket(fct: pl.LazyFrame, dims: Sequence[str] = ()) -
     """Compute decline and failure rates per USD ticket size bucket.
 
     Grain: one row per ``dims`` x ``amount_bucket``. Buckets are left closed:
-    0-10, 10-25, 25-50, 50-100, 100-250 and 250+ USD.
+    0-10, 10-20, 20-50, 50-100, 100-250 and 250+ USD.
 
     Args:
         fct: One row per transaction, with ``amount_usd``.
@@ -188,24 +190,76 @@ def decline_rate_by_amount_bucket(fct: pl.LazyFrame, dims: Sequence[str] = ()) -
     )
 
 
+def decline_rate_by_card_brand(fct: pl.LazyFrame, dims: Sequence[str] = ()) -> pl.LazyFrame:
+    """Compute decline and failure rates per card brand.
+
+    Grain: one row per ``dims`` x ``card_brand``, over card transactions only.
+
+    Args:
+        fct: One row per transaction, with ``card_brand`` (null for non card methods).
+        dims: Extra columns to split by, for example ``["country"]``.
+
+    Returns:
+        ``dims``, ``card_brand`` and the columns of ``analytics.metrics.outcome_rates``.
+    """
+    cards = fct.filter(pl.col("card_brand").is_not_null())
+    return _outcome_rates_by(cards, [*dims, "card_brand"])
+
+
+def decline_rate_by_merchant_segment(fct: pl.LazyFrame, segment: MerchantSegment) -> pl.LazyFrame:
+    """Compute decline and failure rates per merchant segment.
+
+    Grain: one row per value of ``segment`` (the merchant's category or its size tier).
+
+    Args:
+        fct: One row per transaction, with the ``segment`` column.
+        segment: ``merchant_category`` or ``merchant_size_tier``.
+
+    Returns:
+        ``segment`` and the columns of ``analytics.metrics.outcome_rates``.
+    """
+    return _outcome_rates_by(fct, [segment])
+
+
 def voucher_expiration_by_amount_bucket(fct: pl.LazyFrame) -> pl.LazyFrame:
-    """Compute the voucher expiration rate per voucher method and USD ticket size bucket.
+    """Compute the voucher expiration rate and the share of expirations per ticket size bucket.
 
     Grain: one row per ``payment_method`` x ``amount_bucket``, over voucher methods (OXXO,
     Boleto) only.
+
+    Formulas:
+        ``expiration_rate = expired / voucher_attempts`` within the bucket (how likely a voucher
+            of that size is to expire)
+        ``share_of_expired = expired / all expired vouchers of the method`` (where the
+            expirations are; the shares of one method sum to 1)
+        ``cumulative_share_of_expired`` = running sum of ``share_of_expired`` from the smallest
+            bucket, which reads as "x% of expirations are below this bucket's upper edge"
 
     Args:
         fct: One row per transaction, with ``amount_usd``.
 
     Returns:
         ``payment_method``, ``amount_bucket_order``, ``amount_bucket``, ``voucher_attempts``,
-        ``expired``, ``expiration_rate`` and its Wilson bounds, for buckets with resolved vouchers.
+        ``expired``, ``expiration_rate`` and its Wilson bounds, ``share_of_expired`` and
+        ``cumulative_share_of_expired``, for buckets with resolved vouchers.
     """
     dims = ["payment_method", "amount_bucket_order", "amount_bucket"]
     return (
         _outcome_rates_by(_with_amount_bucket(fct), dims)
         .filter(pl.col("voucher_attempts") > 0)
         .select(*dims, "voucher_attempts", pl.col("^expir.*$"))
+        .sort("payment_method", "amount_bucket_order")
+        .with_columns(
+            (pl.col("expired") / pl.col("expired").sum().over("payment_method")).alias(
+                "share_of_expired"
+            )
+        )
+        .with_columns(
+            pl.col("share_of_expired")
+            .cum_sum()
+            .over("payment_method")
+            .alias("cumulative_share_of_expired")
+        )
     )
 
 

@@ -38,6 +38,8 @@ OUTPUT = ROOT / "docs" / "ANALYSIS.md"
 COUNTRY_NAMES = {"MX": "Mexico", "BR": "Brazil", "CO": "Colombia", "CL": "Chile"}
 NEW_PSP_COUNTRY = "CO"
 DAYS_PER_MONTH = 30
+# The ticket bucket that ends at 20 USD: vouchers at or below it are "small".
+SMALL_TICKET_BUCKET = "10-20"
 # One percentage point of approval rate, used to price an improvement in card approvals.
 ONE_POINT = 0.01
 
@@ -282,6 +284,40 @@ def build() -> str:
         .collect()
     )
     top_reason = reasons.row(0, named=True)
+    small_vouchers = {
+        method: share
+        for method, share in anomalies.voucher_expiration_by_amount_bucket(FCT)
+        .filter(pl.col("amount_bucket") == SMALL_TICKET_BUCKET)
+        .select("payment_method", "cumulative_share_of_expired")
+        .collect()
+        .rows()
+    }
+    brands = anomalies.decline_rate_by_card_brand(FCT).sort("decline_rate").collect()
+    low_brand, high_brand = brands.row(0, named=True), brands.row(-1, named=True)
+    assert high_brand["decline_rate_wilson_low"] > low_brand["decline_rate_wilson_high"]
+    tiers = (
+        anomalies.decline_rate_by_merchant_segment(FCT, "merchant_size_tier")
+        .sort("decline_rate")
+        .collect()
+    )
+    low_tier, high_tier = tiers.row(0, named=True), tiers.row(-1, named=True)
+    categories = (
+        anomalies.decline_rate_by_merchant_segment(FCT, "merchant_category")
+        .sort("decline_rate")
+        .collect()
+    )
+    low_cat, high_cat = categories.row(0, named=True), categories.row(-1, named=True)
+    assert high_cat["merchant_category"] == sick["merchant_category"], "top category claim"
+    safe_shifts = by_cost.filter(
+        (pl.col("monthly_savings_usd") > 0) & (pl.col("monthly_gmv_delta_usd") >= 0)
+    )
+    safe_text = "; ".join(
+        f"{COUNTRY_NAMES[row['country']]} {row['payment_method']} from {row['worst_psp']} to "
+        f"{row['best_psp']} ({usd(row['monthly_savings_usd'])} saved, "
+        f"{usd(row['monthly_gmv_delta_usd'])} more approved)"
+        for row in safe_shifts.iter_rows(named=True)
+    )
+    assert safe_shifts.height > 0, "no shift saves fees while maintaining approval rates"
     by_bucket = anomalies.decline_rate_by_amount_bucket(FCT).collect().get_column("decline_rate")
 
     country_rows = [
@@ -355,7 +391,8 @@ def build() -> str:
     return f"""# Payment performance: findings and recommendations
 
 For the CFO. Period {first} to {last} ({days} days), {transactions:,} transactions from {merchants}
-merchants in {len(country_rows)} countries. Generated from the marts by `make analysis`; do not edit
+merchants. Countries: TiendaMax's three markets (Mexico, Colombia, Chile) plus Brazil, included to
+cover PIX and Boleto. Generated from the marts by `make analysis`; do not edit
 by hand. The dataset is synthetic, so the amounts illustrate the method. USD at fixed rates.
 Monthly figures are the period scaled to 30 days. Ranges are 95% confidence intervals.
 
@@ -411,7 +448,12 @@ approval rates observed.
 
 {shift_table}
 
-**Recommendation**: route on approval rate. It costs about {usd(rate_fees)} a month in fees and
+Shifts that save fees **while maintaining approval rates**, per month:
+{safe_text}.
+These can be made today at no cost to sales.
+
+**Recommendation**: make those shifts, and otherwise route on approval rate. It costs about
+{usd(rate_fees)} a month in fees and
 adds about {usd(rate_gain)} a month in approved sales. Use the cost per sale to negotiate fees, not
 to route.
 
@@ -431,6 +473,18 @@ to route.
 - Most failures are refusals, not outages: {top_reason["decline_reason"]} alone is
   {pct(top_reason["share"])} of declined and failed payments. Ticket size does not matter (decline
   rate {pct(by_bucket.min())} to {pct(by_bucket.max())} across ticket sizes).
+- By merchant segment the decline rate runs from {pct(low_tier["decline_rate"])}
+  ({low_tier["merchant_size_tier"]}) to {pct(high_tier["decline_rate"])}
+  ({high_tier["merchant_size_tier"]}) across size tiers, and from {pct(low_cat["decline_rate"])}
+  ({low_cat["merchant_category"]}) to {pct(high_cat["decline_rate"])}
+  ({high_cat["merchant_category"]}) across categories. The top category contains
+  {sick["merchant_id"]}, so part of that gap is one merchant.
+- Card brand does matter: {high_brand["card_brand"].capitalize()} declines
+  {pct(high_brand["decline_rate"])} of attempts against {pct(low_brand["decline_rate"])} for
+  {low_brand["card_brand"].capitalize()} (n = {high_brand["attempts"]:,} and
+  {low_brand["attempts"]:,}; the intervals do not overlap).
+- Small tickets are not where vouchers are lost: {pct(small_vouchers["oxxo"], 0)} of OXXO and
+  {pct(small_vouchers["boleto"], 0)} of Boleto expirations are on tickets under 20 USD.
 
 **Recommendation**: alert on these rules daily and hourly; ask {incident_key[0]} and {outage_psp}
 for incident reports; have the account team contact {sick["merchant_id"]},

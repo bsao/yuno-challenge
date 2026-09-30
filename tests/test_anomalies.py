@@ -160,7 +160,7 @@ def test_small_merchants_are_not_flagged() -> None:
 
 
 def test_amount_buckets_are_left_closed() -> None:
-    """9.99 USD is in 0-10, exactly 10 USD is in 10-25 and exactly 250 USD is in 250+."""
+    """9.99 USD is in 0-10, 10 USD in 10-20, 24.99 USD in 20-50 and exactly 250 USD in 250+."""
     fct = _transactions(
         [
             {"amount_usd": 9.99, "final_status": "declined"},
@@ -172,10 +172,10 @@ def test_amount_buckets_are_left_closed() -> None:
 
     result = anomalies.decline_rate_by_amount_bucket(fct).collect()
 
-    assert result.get_column("amount_bucket").to_list() == ["0-10", "10-25", "250+"]
-    assert result.get_column("attempts").to_list() == [1, 2, 1]
-    assert result.get_column("decline_rate").to_list() == pytest.approx([1.0, 0.5, 0.0])
-    assert result.get_column("failure_rate").to_list() == pytest.approx([0.0, 0.0, 1.0])
+    assert result.get_column("amount_bucket").to_list() == ["0-10", "10-20", "20-50", "250+"]
+    assert result.get_column("attempts").to_list() == [1, 1, 1, 1]
+    assert result.get_column("decline_rate").to_list() == pytest.approx([1.0, 0.0, 1.0, 0.0])
+    assert result.get_column("failure_rate").to_list() == pytest.approx([0.0, 0.0, 0.0, 1.0])
 
 
 def test_reason_breakdown_shares_sum_to_one_per_country_and_method() -> None:
@@ -270,8 +270,67 @@ def test_voucher_expiration_by_merchant_uses_resolved_vouchers_only() -> None:
     assert result.get_column("voucher_attempts").to_list() == [4]
     assert result.get_column("expiration_rate").to_list() == pytest.approx([0.75])
     by_bucket = anomalies.voucher_expiration_by_amount_bucket(fct).collect()
-    assert by_bucket.get_column("amount_bucket").to_list() == ["10-25"]
+    assert by_bucket.get_column("amount_bucket").to_list() == ["20-50"]
     assert by_bucket.get_column("expiration_rate").to_list() == pytest.approx([0.75])
+
+
+def test_share_of_expired_vouchers_by_ticket_size() -> None:
+    """Of 10 expired OXXO vouchers, 5 are under 20 USD: the cumulative share there is 50%."""
+    expired = {"payment_method": "oxxo", "final_status": "expired", "decline_reason": "expired"}
+    fct = _transactions(
+        [
+            {**expired, "amount_usd": 5.0, "n": 2},
+            {**expired, "amount_usd": 15.0, "n": 3},
+            {**expired, "amount_usd": 30.0, "n": 5},
+            {"payment_method": "oxxo", "final_status": "approved", "amount_usd": 5.0, "n": 2},
+            {"payment_method": "oxxo", "final_status": "approved", "amount_usd": 30.0, "n": 15},
+        ]
+    )
+
+    result = anomalies.voucher_expiration_by_amount_bucket(fct).collect()
+
+    assert result.get_column("amount_bucket").to_list() == ["0-10", "10-20", "20-50"]
+    assert result.get_column("expiration_rate").to_list() == pytest.approx([0.5, 1.0, 0.25])
+    assert result.get_column("share_of_expired").to_list() == pytest.approx([0.2, 0.3, 0.5])
+    assert result.get_column("cumulative_share_of_expired").to_list() == pytest.approx(
+        [0.2, 0.5, 1.0]
+    )
+
+
+def test_decline_rate_by_card_brand_ignores_non_card_methods() -> None:
+    """Visa declines 1 of 4 and Mastercard 2 of 4; the PSE decline has no brand."""
+    fct = _transactions(
+        [
+            {"card_brand": "visa", "final_status": "approved", "n": 3},
+            {"card_brand": "visa", "final_status": "declined", "n": 1},
+            {"card_brand": "mastercard", "final_status": "approved", "n": 2},
+            {"card_brand": "mastercard", "final_status": "declined", "n": 2},
+            {"card_brand": None, "payment_method": "pse", "final_status": "declined", "n": 5},
+        ]
+    )
+
+    result = anomalies.decline_rate_by_card_brand(fct).collect()
+
+    assert result.get_column("card_brand").to_list() == ["mastercard", "visa"]
+    assert result.get_column("attempts").to_list() == [4, 4]
+    assert result.get_column("decline_rate").to_list() == pytest.approx([0.5, 0.25])
+
+
+def test_decline_rate_by_merchant_segment() -> None:
+    """Small merchants decline 3 of 4 and enterprise merchants 1 of 4."""
+    fct = _transactions(
+        [
+            {"merchant_size_tier": "small", "final_status": "declined", "n": 3},
+            {"merchant_size_tier": "small", "final_status": "approved", "n": 1},
+            {"merchant_size_tier": "enterprise", "final_status": "declined", "n": 1},
+            {"merchant_size_tier": "enterprise", "final_status": "approved", "n": 3},
+        ]
+    )
+
+    result = anomalies.decline_rate_by_merchant_segment(fct, "merchant_size_tier").collect()
+
+    assert result.get_column("merchant_size_tier").to_list() == ["enterprise", "small"]
+    assert result.get_column("decline_rate").to_list() == pytest.approx([0.25, 0.75])
 
 
 def test_hourly_reason_rate_is_scored_against_the_trailing_14_days() -> None:

@@ -1,7 +1,8 @@
 # Payment performance: findings and recommendations
 
 For the CFO. Period 2026-07-03 to 2026-09-30 (90 days), 1,200,000 transactions from 120
-merchants in 4 countries. Generated from the marts by `make analysis`; do not edit
+merchants. Countries: TiendaMax's three markets (Mexico, Colombia, Chile) plus Brazil, included to
+cover PIX and Boleto. Generated from the marts by `make analysis`; do not edit
 by hand. The dataset is synthetic, so the amounts illustrate the method. USD at fixed rates.
 Monthly figures are the period scaled to 30 days. Ranges are 95% confidence intervals.
 
@@ -85,7 +86,12 @@ approval rates observed.
 | Cheapest PSP per sale | $4,675 | -1,050 | -$47,881 |
 | Highest authorization rate | -$3,846 | +1,247 | $53,218 |
 
-**Recommendation**: route on approval rate. It costs about $3,846 a month in fees and
+Shifts that save fees **while maintaining approval rates**, per month:
+Chile card from PSP_A to PSP_B ($21 saved, $4,858 more approved); Chile webpay from PSP_A to PSP_B ($29 saved, $2,204 more approved).
+These can be made today at no cost to sales.
+
+**Recommendation**: make those shifts, and otherwise route on approval rate. It costs about
+$3,846 a month in fees and
 adds about $53,218 a month in approved sales. Use the cost per sale to negotiate fees, not
 to route.
 
@@ -111,6 +117,18 @@ to route.
 - Most failures are refusals, not outages: insufficient_funds alone is
   41.8% of declined and failed payments. Ticket size does not matter (decline
   rate 17.6% to 17.9% across ticket sizes).
+- By merchant segment the decline rate runs from 16.9%
+  (small) to 18.2%
+  (enterprise) across size tiers, and from 14.7%
+  (beauty) to 20.1%
+  (travel) across categories. The top category contains
+  mrc_020, so part of that gap is one merchant.
+- Card brand does matter: Mastercard declines
+  24.1% of attempts against 22.1% for
+  Visa (n = 291,163 and
+  438,007; the intervals do not overlap).
+- Small tickets are not where vouchers are lost: 28% of OXXO and
+  27% of Boleto expirations are on tickets under 20 USD.
 
 **Recommendation**: alert on these rules daily and hourly; ask PSP_C and PSP_B
 for incident reports; have the account team contact mrc_020,

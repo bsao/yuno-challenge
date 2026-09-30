@@ -59,6 +59,30 @@ CRITICAL = "#d03b3b"
 PSP_COLORS = {"PSP_A": BLUE, "PSP_B": ORANGE, "PSP_C": "#1baf7a", "PSP_D": "#eda100"}
 STATUS_COLORS = {"declined": BLUE, "failed": ORANGE}
 VOUCHER_COLORS = {"oxxo": BLUE, "boleto": ORANGE}
+# Fixed colour per entity, in the validated categorical order, so a filter never repaints one.
+SERIES = [BLUE, ORANGE, "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7"]
+DIMENSION_COLORS: dict[str, dict[str, str]] = {
+    "country": dict(zip(["MX", "BR", "CO", "CL"], SERIES, strict=False)),
+    "payment_method": dict(
+        zip(["card", "pix", "spei", "pse", "oxxo", "boleto", "webpay"], SERIES, strict=True)
+    ),
+    "psp": PSP_COLORS,
+}
+BREAKDOWNS: dict[str, str | None] = {
+    "Total": None,
+    "Country": "country",
+    "Payment method": "payment_method",
+    "PSP": "psp",
+}
+BREAKDOWN_LABELS = {"country": "Country", "payment_method": "Payment method", "psp": "PSP"}
+BREAKDOWN_DECISIONS = {
+    "auth_rate": "see which segment drags the overall approval rate, and since when.",
+    "attempts": "see where volume is growing or shifting before it shows in revenue.",
+    "net_gmv_usd": "size each segment's revenue, so effort goes where the money is.",
+}
+# The 10-20 USD bucket ends at 20 USD, the ticket size below which vouchers are "small".
+SMALL_TICKET_BUCKET = "10-20"
+SMALL_TICKET_USD = 20
 SEQUENTIAL = ["#cde2fb", "#86b6ef", "#3987e5", "#1c5cab", "#0d366b"]
 
 Filters = tuple[date, date, tuple[str, ...]]
@@ -113,6 +137,13 @@ def load_failure_views(filters: Filters) -> dict[str, pl.DataFrame]:
         "reasons": anomalies.reason_breakdown(fct).collect(),
         "heatmap": anomalies.decline_heatmap(fct).collect(),
         "amount": anomalies.decline_rate_by_amount_bucket(fct).collect(),
+        "card_brand": anomalies.decline_rate_by_card_brand(fct).collect(),
+        "merchant_category": anomalies.decline_rate_by_merchant_segment(
+            fct, "merchant_category"
+        ).collect(),
+        "merchant_size_tier": anomalies.decline_rate_by_merchant_segment(
+            fct, "merchant_size_tier"
+        ).collect(),
         "voucher_amount": anomalies.voucher_expiration_by_amount_bucket(fct).collect(),
         "voucher_merchant": anomalies.voucher_expiration_by_merchant(fct).collect(),
     }
@@ -200,6 +231,84 @@ def _error_bars(frame: pl.DataFrame, rate: str, low: str, high: str) -> dict[str
     }
 
 
+def _rate_bars(frame: pl.DataFrame, category: str, title: str) -> go.Figure:
+    """Build a bar chart of the decline rate per category with Wilson 95% error bars."""
+    figure = go.Figure(
+        go.Bar(
+            x=frame.get_column(category).to_list(),
+            y=frame.get_column("decline_rate").to_list(),
+            customdata=frame.select("attempts", "failure_rate").rows(),
+            error_y=_error_bars(
+                frame, "decline_rate", "decline_rate_wilson_low", "decline_rate_wilson_high"
+            ),
+            marker={"color": BLUE, "cornerradius": 4},
+            width=0.55,
+            text=[f"n = {n:,}" for n in frame.get_column("attempts")],
+            textposition="inside",
+            insidetextanchor="start",
+            textfont={"color": "white"},
+            hovertemplate=(
+                "%{x}<br>Decline rate %{y:.1%}<br>Failure rate %{customdata[1]:.1%}<br>"
+                "n = %{customdata[0]:,}<extra></extra>"
+            ),
+        )
+    )
+    figure.update_layout(title=title)
+    figure.update_yaxes(tickformat=".0%", rangemode="tozero")
+    return figure
+
+
+def render_breakdown(filters: Filters, dim: str) -> None:
+    """Render volume, authorization rate and GMV for one dimension, as a table and over time."""
+    colors = DIMENSION_COLORS[dim]
+    summary = load_performance(filters, (dim,)).sort("gmv_usd", descending=True)
+    st.dataframe(
+        summary.select(
+            pl.col(dim).alias(BREAKDOWN_LABELS[dim]),
+            pl.col("attempts").alias("Attempts"),
+            pl.col("auth_rate").map_elements(_pct, return_dtype=pl.String).alias("Auth rate"),
+            pl.struct("wilson_low", "wilson_high")
+            .map_elements(
+                lambda s: _interval(s["wilson_low"], s["wilson_high"]), return_dtype=pl.String
+            )
+            .alias("Wilson 95%"),
+            pl.col("gmv_usd").round(0).alias("GMV USD"),
+            pl.col("net_gmv_usd").round(0).alias("Net GMV USD"),
+        ),
+        hide_index=True,
+    )
+    daily = load_performance(filters, ("date", dim))
+    for column, title, axis, hover in (
+        ("auth_rate", "Daily authorization rate", {"tickformat": ".0%"}, "%{y:.1%}"),
+        ("attempts", "Daily attempts", {"rangemode": "tozero"}, "%{y:,}"),
+        (
+            "net_gmv_usd",
+            "Daily net GMV (USD)",
+            {"tickprefix": "$", "rangemode": "tozero"},
+            "$%{y:,.0f}",
+        ),
+    ):
+        chart = go.Figure()
+        for name in sorted(summary.get_column(dim).to_list(), key=list(colors).index):
+            rows = daily.filter(pl.col(dim) == name)
+            chart.add_trace(
+                go.Scatter(
+                    x=rows.get_column("date").to_list(),
+                    y=rows.get_column(column).to_list(),
+                    customdata=rows.select("attempts").rows(),
+                    mode="lines",
+                    line={"color": colors[name], "width": 2},
+                    name=name,
+                    hovertemplate=f"{name} {hover}, n = %{{customdata[0]:,}}<extra></extra>",
+                )
+            )
+        chart.update_layout(
+            title=f"{title} by {BREAKDOWN_LABELS[dim].lower()}", hovermode="x unified"
+        )
+        chart.update_yaxes(**axis)
+        _show(_style(chart, height=320), BREAKDOWN_DECISIONS[column])
+
+
 def render_overview(filters: Filters) -> None:
     """Render the headline numbers and the daily trends."""
     total = load_performance(filters, ()).row(0, named=True)
@@ -213,6 +322,11 @@ def render_overview(filters: Filters) -> None:
         f"approved. Wilson 95% interval {_interval(total['wilson_low'], total['wilson_high'])}, "
         f"n = {total['attempts']:,} attempts. Net GMV subtracts refunds. USD at fixed rates."
     )
+
+    dim = BREAKDOWNS[st.radio("Break down by", list(BREAKDOWNS), horizontal=True)]
+    if dim is not None:
+        render_breakdown(filters, dim)
+        return
 
     daily = load_performance(filters, ("date",))
     dates = daily.get_column("date").to_list()
@@ -529,6 +643,29 @@ def render_failures(filters: Filters) -> None:
         "decide whether high tickets need 3DS, instalments or a different route.",
     )
 
+    brand_column, segment_column = st.columns(2)
+    with brand_column:
+        _show(
+            _style(
+                _rate_bars(views["card_brand"], "card_brand", "Decline rate by card brand"),
+                height=320,
+            ),
+            "take a brand specific decline gap to the acquirer or the card network.",
+        )
+    with segment_column:
+        segment = st.radio(
+            "Merchant segment",
+            ["merchant_category", "merchant_size_tier"],
+            format_func={"merchant_category": "Category", "merchant_size_tier": "Size tier"}.get,
+            horizontal=True,
+        )
+        _show(
+            _style(
+                _rate_bars(views[segment], segment, "Decline rate by merchant segment"), height=320
+            ),
+            "see whether a category or merchant size needs its own risk rules or routing.",
+        )
+
     by_amount, by_merchant = views["voucher_amount"], views["voucher_merchant"].head(MERCHANT_ROWS)
     if by_amount.height == 0:
         st.info("No voucher payments in the current filters (OXXO in Mexico, Boleto in Brazil).")
@@ -543,7 +680,9 @@ def render_failures(filters: Filters) -> None:
             go.Bar(
                 x=rows.get_column("amount_bucket").to_list(),
                 y=rows.get_column("expiration_rate").to_list(),
-                customdata=rows.select("voucher_attempts").rows(),
+                customdata=rows.select(
+                    "voucher_attempts", "share_of_expired", "cumulative_share_of_expired"
+                ).rows(),
                 error_y=_error_bars(
                     rows,
                     "expiration_rate",
@@ -553,8 +692,9 @@ def render_failures(filters: Filters) -> None:
                 marker={"color": color, "cornerradius": 4},
                 name=method,
                 hovertemplate=(
-                    method + " %{x} USD<br>Expiration rate %{y:.1%}<br>"
-                    "n = %{customdata[0]:,}<extra></extra>"
+                    method + " %{x} USD<br>Expiration rate %{y:.1%}, n = %{customdata[0]:,}<br>"
+                    "%{customdata[1]:.0%} of expirations are in this bucket, "
+                    "%{customdata[2]:.0%} at or below it<extra></extra>"
                 ),
             )
         )
@@ -565,8 +705,30 @@ def render_failures(filters: Filters) -> None:
     with left:
         _show(
             _style(ticket_chart),
-            "decide whether voucher payment reminders should target a ticket size.",
+            "decide whether voucher payment reminders should target a ticket size. "
+            + "; ".join(
+                f"{pct:.0%} of {method} expirations are under {SMALL_TICKET_USD} USD"
+                for method, pct in by_amount.filter(pl.col("amount_bucket") == SMALL_TICKET_BUCKET)
+                .select("payment_method", "cumulative_share_of_expired")
+                .rows()
+            )
+            + ".",
         )
+        with st.expander("Voucher expirations by ticket size as a table"):
+            st.dataframe(
+                by_amount.select(
+                    "payment_method",
+                    "amount_bucket",
+                    "voucher_attempts",
+                    "expired",
+                    pl.col("expiration_rate").map_elements(_pct, return_dtype=pl.String),
+                    pl.col("share_of_expired").map_elements(_pct, return_dtype=pl.String),
+                    pl.col("cumulative_share_of_expired").map_elements(
+                        _pct, return_dtype=pl.String
+                    ),
+                ),
+                hide_index=True,
+            )
     ordered = by_merchant.sort("expiration_rate")
     merchant_chart = go.Figure(
         go.Bar(

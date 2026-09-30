@@ -27,7 +27,8 @@ in [ANALYSIS.md](ANALYSIS.md).
 | 9 | Brazil | BRL, PIX and Boleto added end to end; every step re-verified | ADR 6 |
 | 10 | Documentation | README, ADRs, and a CFO memo generated from the marts | |
 | 11 | Realistic merchant health | Two planted merchant problems; a 30 day score with a processing or ux diagnosis; significance marks on the heatmap | ADR 8 |
-| 12 | Reviewer pass | Clean clone, README followed literally, scored against the rubric | below |
+| 12 | Reviewer pass | Clean copy, README followed literally: `docker compose up --build` healthy, `make check` in the image passes, memo regenerated in the container byte identical | |
+| 13 | Alignment with the brief | Card brand and merchant segment failure views; share of voucher expirations under 20 USD; volume, rate and GMV by country, method and PSP over time; approval preserving shifts in the memo | ADR 9 |
 
 A first generator, built before the specification of step 2 arrived, was replaced by it.
 

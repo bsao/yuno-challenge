@@ -196,9 +196,16 @@ Stated once here; each is also in the docstring of the module that relies on it.
 - **Snapshot**: the raw file is a snapshot taken at 2026-10-01 06:00 UTC. Status changes after it
   are not emitted, so recent transactions and vouchers in their last 72 hours are still `pending`
   and are excluded from every rate.
+- **Right edge bias**: because pending vouchers are excluded while their early failures are
+  counted, the voucher authorization rate of the last three days is understated.
 - **Refunds** are full refunds and happen 1 to 10 days after approval, so the refund rate of the
   most recent days is understated.
-- **Merchants** operate in one country and keep one category.
+- **Merchants** operate in one country and keep one category. 120 merchants stand in for
+  TiendaMax's 15,000.
+- **Countries**: TiendaMax operates in Mexico, Colombia and Chile. Brazil is added to cover PIX
+  and Boleto; every view can be filtered to the three markets.
+- **States**: the "authorized" state (funds reserved) is folded into approved, because the
+  webhooks carry the outcome and not the intermediate reservation.
 - **Vouchers** (OXXO, Boleto) expire 72 hours after creation; other methods expire with the
   checkout session after 30 minutes. PIX is treated as an instant transfer, not a voucher.
 - **Cards** are one payment method with a brand (Visa, Mastercard), so method views are not split

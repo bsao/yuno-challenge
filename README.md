@@ -72,7 +72,7 @@ at read time by `analytics/metrics.py`, so any rollup is correct.
 `make data` writes 1,200,000 transactions over 90 local days ending 2026-09-30 (TiendaMax's real
 volume of about 400,000 a month). The same seed always gives byte identical files.
 
-- Four countries and currencies: Mexico (MXN), Brazil (BRL), Colombia (COP), Chile (CLP).
+- Four countries and currencies: Mexico (MXN), Colombia (COP), Chile (CLP), plus Brazil (BRL).
 - Cards (Visa, Mastercard) everywhere; OXXO and SPEI in Mexico; PIX and Boleto in Brazil; PSE in
   Colombia; Webpay in Chile. OXXO and Boleto are cash vouchers that are paid later or expire.
 - Four PSPs with different authorization rates per segment; PSP_C and PSP_D serve Colombia only,
@@ -99,6 +99,12 @@ All in `analytics/metrics.py`; full table in [docs/DECISIONS.md](docs/DECISIONS.
 
 ## Assumptions
 
+- TiendaMax's markets are Mexico, Colombia and Chile. Brazil is added on top, to cover PIX and
+  Boleto, which the brief lists among the payment methods; filter it out in the sidebar to see
+  the three markets alone.
+- The "authorized" state (funds reserved) is folded into approved: the webhooks carry the
+  outcome, not the intermediate reservation.
+- 120 merchants stand in for TiendaMax's 15,000, keeping the long tail of volume.
 - Latest status is decided by event time, not arrival order. Refunds are full refunds.
 - A merchant operates in one country. Transaction attributes never change between events.
 - USD uses fixed, illustrative rates and exists only to sum across countries.
@@ -121,6 +127,10 @@ All in `analytics/metrics.py`; full table in [docs/DECISIONS.md](docs/DECISIONS.
   aggregate mart stores USD only.
 - The generator has no runtime assertions of its own; its output is validated by ingestion.
 - No seasonality model in the anomaly baselines.
+- **The last three days understate voucher approval.** OXXO and Boleto vouchers have 72 hours to
+  be paid; in the newest days the unpaid ones are still pending and excluded while early failures
+  are already counted, so the daily voucher authorization rate dips at the right edge of the
+  trend. It is an artefact of the snapshot, not a drop.
 
 ## How to productionize
 
