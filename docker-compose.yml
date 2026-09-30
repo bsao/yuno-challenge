@@ -1,0 +1,38 @@
+services:
+  pipeline:
+    build: .
+    image: tiendamax-payment-intelligence
+    command: ["python", "-m", "pipeline.run"]
+    volumes:
+      - data:/app/data
+
+  app:
+    image: tiendamax-payment-intelligence
+    depends_on:
+      pipeline:
+        condition: service_completed_successfully
+    command:
+      - streamlit
+      - run
+      - app/streamlit_app.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+      - --server.headless=true
+    ports:
+      - "8501:8501"
+    volumes:
+      - data:/app/data
+    healthcheck:
+      # Written in Python because slim images ship without curl.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=3).status == 200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  data:
