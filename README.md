@@ -79,8 +79,9 @@ volume of about 400,000 a month). The same seed always gives byte identical file
   for the last 45 days.
 - 120 merchants with a long tail of volume; hourly and weekday seasonality.
 - About 1% of webhooks are delivered twice and 3% arrive late, so events are out of order.
-- Three planted anomalies, recorded as ground truth in `planted_anomalies.json` and recovered by
-  the detectors: a three day decline spike, a merchant whose vouchers expire, a night outage.
+- Five planted anomalies, recorded as ground truth in `planted_anomalies.json` and recovered by
+  the detectors (tested): a three day PSP decline spike, a merchant whose vouchers expire, a night
+  outage, a merchant with a processing problem and a merchant with a checkout problem.
 
 ## Metric definitions
 
@@ -92,6 +93,8 @@ All in `analytics/metrics.py`; full table in [docs/DECISIONS.md](docs/DECISIONS.
 | Completion rate | paid / (paid + expired), voucher methods (OXXO, Boleto) only |
 | GMV, net GMV | amount approved including later refunds; net subtracts refunds |
 | Decline rate, failure rate | declined / attempts (refusals), failed / attempts (technical errors) |
+| Abandonment rate | expired / (attempts + expired): the customer never completed the payment |
+| Merchant health | 0 to 100 on the last 30 days: authorization against peers 35%, abandonment against peers 20%, volume trend 20%, failures 15%, refunds 10%; below 50 is at risk, and the main driver gives the diagnosis (processing or ux) |
 | Confidence | every rate carries its sample size and a Wilson 95% interval |
 
 ## Assumptions
@@ -104,15 +107,20 @@ All in `analytics/metrics.py`; full table in [docs/DECISIONS.md](docs/DECISIONS.
 
 ## Known limitations
 
-- The pipeline is a full refresh in memory: about 2.4 GB at the default scale, for the pipeline
-  and for `make check` (one test runs it at full scale). Use `--transactions` for less.
-- The daily anomaly rule (z >= 3) raises chance flags: 13 flags, 3 of them the planted incident.
-- The health score has no voucher completion component and labels every merchant healthy; the
-  dataset plants no merchant decline over time, so question three is answered only for the
-  voucher merchant found by the peer detector.
+- **Memory**: the pipeline is a full refresh in memory and peaks at about 2.4 GB at the default
+  scale; so does `make check`, because one test runs the pipeline at full scale. Give Docker at
+  least 4 GB, or pass `--transactions` to `data_gen.generate` for a smaller dataset.
+- **The daily anomaly rule (z >= 3) is noisy** and cannot tell a PSP problem from a large
+  merchant's problem: of its 33 flags, 3 are the PSP incident, 27 are the Brazilian segments of
+  one struggling merchant and 3 are chance. The health score is what separates the two.
+- **The health score's weights and anchors are judgement**, not fitted to a churn label.
 - Merchant comparisons are not adjusted for payment method mix.
-- The cost simulation holds authorization rates constant and assumes no margin.
-- The decline heatmap shows sample size but no interval per cell.
+- The cost simulation holds authorization rates constant and assumes no margin; the fee model
+  itself is an assumption.
+- USD amounts use fixed illustrative rates and appear in single country views too, because the
+  aggregate mart stores USD only.
+- The generator has no runtime assertions of its own; its output is validated by ingestion.
+- No seasonality model in the anomaly baselines.
 
 ## How to productionize
 

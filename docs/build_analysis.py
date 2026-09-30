@@ -8,8 +8,10 @@ Outputs: ``docs/ANALYSIS.md``. Run with ``make analysis``.
 
 Every rate comes from ``analytics``. The memo adds three estimates of its own, each stated in the
 text: monthly figures (window total * 30 / days), sales lost in an incident (excess declines or
-failures * the average approved ticket of the segment) and recoverable voucher sales (vouchers *
-the gap to the peer completion rate * the merchant's average voucher amount).
+failures * the average approved ticket of the segment), recoverable voucher sales (vouchers * the
+gap to the peer completion rate * the merchant's average voucher amount) and sales lost at an at
+risk merchant (attempts * the gap to the peer approval rate, or the transactions no longer made *
+the approval rate, each * the merchant's average approved ticket).
 
 The narrative states conclusions (for example which PSP to keep). Each one is guarded by an
 assertion on the data, so the script fails instead of printing a conclusion the data no longer
@@ -22,8 +24,10 @@ from typing import Any
 import polars as pl
 
 from analytics import anomalies, cost
+from analytics.health import WINDOW_DAYS as HEALTH_WINDOW_DAYS
 from analytics.health import merchant_health
 from analytics.metrics import NOT_APPROVED_STATUSES, VOUCHER_METHODS, performance
+from pipeline.transform import aggregate_additive_measures
 
 ROOT = Path(__file__).resolve().parents[1]
 FCT = pl.scan_parquet(ROOT / "data" / "marts" / "fct_transactions.parquet")
@@ -34,6 +38,8 @@ OUTPUT = ROOT / "docs" / "ANALYSIS.md"
 COUNTRY_NAMES = {"MX": "Mexico", "BR": "Brazil", "CO": "Colombia", "CL": "Chile"}
 NEW_PSP_COUNTRY = "CO"
 DAYS_PER_MONTH = 30
+# One percentage point of approval rate, used to price an improvement in card approvals.
+ONE_POINT = 0.01
 
 
 def usd(value: float) -> str:
@@ -106,7 +112,7 @@ def build() -> str:
                 ]
             )
     card_share = card["attempts"] / total["attempts"]
-    card_point_usd = card["attempts"] * 0.01 * card["gmv_usd"] / card["approved"] * monthly
+    card_point_usd = card["attempts"] * ONE_POINT * card["gmv_usd"] / card["approved"] * monthly
 
     # 2. Vouchers.
     vouchers = performance(
@@ -180,19 +186,50 @@ def build() -> str:
     assert rate_gain > 0, "routing by approval rate no longer gains sales"
     assert cost_loss > 3 * by_cost.get_column("monthly_savings_usd").sum(), "cost routing claim"
 
-    # 5. Discovered issues.
+    # 5. Discovered issues. Merchant health first: it explains part of the daily flags.
+    health = merchant_health(FCT).collect()
+    at_risk = health.filter(pl.col("label") == "at_risk")
+    processing = at_risk.filter(pl.col("diagnosis") == "processing")
+    ux = at_risk.filter(pl.col("diagnosis") == "ux")
+    assert processing.height == 1 and ux.height == 1, "expected one merchant per diagnosis"
+    sick, leaving = processing.row(0, named=True), ux.row(0, named=True)
+
+    def merchant_ticket(merchant_id: str) -> float:
+        rows = performance(
+            aggregate_additive_measures(
+                FCT.filter(pl.col("merchant_id") == merchant_id), ["payment_method"]
+            ),
+            [],
+        ).collect()
+        return float(rows.item(0, "gmv_usd") / rows.item(0, "approved"))
+
+    sick_lost = sick["attempts"] * -sick["auth_gap"] * merchant_ticket(sick["merchant_id"])
+    leaving_lost = (
+        (leaving["transactions_prior_30d"] - leaving["transactions_last_30d"])
+        * leaving["auth_rate"]
+        * merchant_ticket(leaving["merchant_id"])
+    )
+
     daily = anomalies.score_daily_decline_rate(AGG).filter(pl.col("is_anomaly")).collect()
     segment = ["psp", "country", "payment_method"]
-    incident_key = (
-        daily.group_by(segment).agg(pl.len().alias("n"), pl.col("z").max()).sort("z").row(-1)
+    clusters = daily.group_by(segment).agg(
+        pl.len().alias("days"), pl.col("date").min().alias("first"), pl.col("z").max().alias("z")
     )
+    merchant_side = clusters.filter(pl.col("country") == sick["country"])
+    assert merchant_side.get_column("psp").n_unique() > 1, "merchant problem no longer spans PSPs"
+    merchant_side_days = int(merchant_side.get_column("days").sum())
+    merchant_side_recent = daily.filter(
+        (pl.col("country") == sick["country"])
+        & (pl.col("date") > pl.lit(last) - pl.duration(days=HEALTH_WINDOW_DAYS))
+    ).height
+    incident_key = clusters.filter(pl.col("country") != sick["country"]).sort("z").row(-1)[:3]
     incident = daily.filter(
         (pl.col("psp") == incident_key[0])
         & (pl.col("country") == incident_key[1])
         & (pl.col("payment_method") == incident_key[2])
     ).sort("date")
-    isolated = daily.height - incident.height
-    isolated_max_z = daily.join(incident, on=["date", *segment], how="anti").get_column("z").max()
+    assert incident.height >= 2, "PSP decline spike is no longer a multi day incident"
+    isolated = daily.height - incident.height - merchant_side_days
     incident_ticket = (
         performance(
             AGG.filter(
@@ -222,8 +259,12 @@ def build() -> str:
     ).sum()
 
     peers = anomalies.score_merchants_against_peers(FCT).filter(pl.col("is_anomaly")).collect()
-    assert peers.height == 1 and peers.row(0, named=True)["metric"] == "completion_rate"
-    broken = peers.row(0, named=True)
+    voucher_flags = peers.filter(pl.col("metric") == "completion_rate")
+    assert voucher_flags.height == 1, "expected one merchant flagged on voucher completion"
+    assert set(peers.filter(pl.col("metric") == "auth_rate").get_column("merchant_id")) <= {
+        sick["merchant_id"]
+    }, "a merchant other than the processing case is flagged on authorization"
+    broken = voucher_flags.row(0, named=True)
     broken_vouchers = FCT.filter(
         (pl.col("merchant_id") == broken["merchant_id"])
         & pl.col("payment_method").is_in(VOUCHER_METHODS)
@@ -243,9 +284,6 @@ def build() -> str:
     top_reason = reasons.row(0, named=True)
     by_bucket = anomalies.decline_rate_by_amount_bucket(FCT).collect().get_column("decline_rate")
 
-    health = merchant_health(FCT).collect()
-    at_risk = health.filter(pl.col("label") == "at_risk").height
-
     country_rows = [
         [
             COUNTRY_NAMES[row["country"]],
@@ -258,6 +296,27 @@ def build() -> str:
     voucher_names = " and ".join(method_label(name) for name in VOUCHER_METHODS)
     incident_dates = incident.get_column("date")
     incident_rows = [
+        [
+            f"Processing problem at merchant {sick['merchant_id']} "
+            f"({COUNTRY_NAMES[sick['country']]})",
+            f"Approval rate {pct(sick['auth_rate'])}, {-sick['auth_gap'] * 100:.0f} points below "
+            f"similar merchants, on {sick['attempts']:,} attempts in 30 days; "
+            f"{pct(sick['failure_rate'])} technical failures",
+            f"About {usd(sick_lost)} a month of sales refused",
+        ],
+        [
+            f"Checkout problem at merchant {leaving['merchant_id']} "
+            f"({COUNTRY_NAMES[leaving['country']]})",
+            f"Abandoned payments {leaving['abandonment_gap'] * 100:.0f} points above similar "
+            f"merchants; volume {pct(leaving['volume_trend'], 0)} against the previous 30 days",
+            f"About {usd(leaving_lost)} a month of sales no longer attempted",
+        ],
+        [
+            f"Broken {method_label(broken_method)} flow at merchant {broken['merchant_id']}",
+            f"{pct(broken['rate'])} of {broken['attempts']:,} vouchers paid against "
+            f"{pct(broken['peer_rate'])} at similar merchants",
+            f"About {usd(recoverable)} a month recoverable at the peer rate",
+        ],
         [
             f"Decline spike at {incident_key[0]}, {COUNTRY_NAMES[incident_key[1]]} "
             f"{incident_key[2]}s, {incident_dates.min()} to {incident_dates.max()}",
@@ -278,12 +337,6 @@ def build() -> str:
             f"{pct(outage.get_column('baseline_rate').min())} normally",
             f"About {excess_failures:,.0f} failed payments; small in money, but a full outage "
             f"nobody saw",
-        ],
-        [
-            f"Broken {method_label(broken_method)} flow at merchant {broken['merchant_id']}",
-            f"{pct(broken['rate'])} of {broken['attempts']:,} vouchers paid against "
-            f"{pct(broken['peer_rate'])} at similar merchants",
-            f"About {usd(recoverable)} a month recoverable at the peer rate",
         ],
     ]
     method_table = table(
@@ -318,7 +371,8 @@ Monthly figures are the period scaled to 30 days. Ranges are 95% confidence inte
 - **Keep {best_psp["psp"]} in Colombia and drop {worst_psp["psp"]}.**
 - **Route by approval rate, not by fee.** Sending traffic to the cheapest PSP saves fees and loses
   several times more in sales.
-- Monitoring found **three incidents** that a monthly report would have missed.
+- Monitoring found **five problems** that a monthly report would have missed: three merchants
+  and two PSP incidents.
 
 ## 1. Payment methods by country
 
@@ -361,22 +415,26 @@ approval rates observed.
 adds about {usd(rate_gain)} a month in approved sales. Use the cost per sale to negotiate fees, not
 to route.
 
-## 4. Incidents found by monitoring
+## 4. Problems found by monitoring
 
 {table(["Issue", "Evidence", "Estimated impact"], incident_rows)}
 
-- The daily rule also raised {isolated} isolated one day flags (strongest z = {isolated_max_z:.1f}
-  against {incident.get_column("z").min():.1f} to {incident.get_column("z").max():.1f} for the
-  incident). At that threshold a few such flags are expected by chance.
+- **Processing or experience?** The health score separates them. {sick["merchant_id"]} loses
+  sales to refusals and errors, a PSP or issuer conversation. {leaving["merchant_id"]} loses them
+  before any PSP is involved: customers abandon the payment and stop coming, a product
+  conversation. {at_risk.height} of {health.height} merchants score below 50.
+- The daily rule raised {daily.height} flags: {incident.height} are the {incident_key[0]}
+  incident, {merchant_side_days} are {COUNTRY_NAMES[sick["country"]]} segments across
+  {merchant_side.get_column("psp").n_unique()} PSPs ({merchant_side_recent} of them in the last
+  {HEALTH_WINDOW_DAYS} days, which is how {sick["merchant_id"]} shows up at PSP level), and
+  {isolated} are isolated one day flags expected by chance at that threshold.
 - Most failures are refusals, not outages: {top_reason["decline_reason"]} alone is
   {pct(top_reason["share"])} of declined and failed payments. Ticket size does not matter (decline
   rate {pct(by_bucket.min())} to {pct(by_bucket.max())} across ticket sizes).
-- Merchant health: {at_risk} of {health.height} merchants score below 50 (range
-  {health.get_column("health_score").min():.0f} to {health.get_column("health_score").max():.0f}).
-  No merchant shows a sustained drop in approvals or volume in this period.
 
-**Recommendation**: alert on these rules daily and hourly, ask {incident_key[0]} and {outage_psp}
-for incident reports, and have the account team contact {broken["merchant_id"]}.
+**Recommendation**: alert on these rules daily and hourly; ask {incident_key[0]} and {outage_psp}
+for incident reports; have the account team contact {sick["merchant_id"]},
+{leaving["merchant_id"]} and {broken["merchant_id"]} this week.
 
 ## Limits of this analysis
 

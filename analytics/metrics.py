@@ -22,6 +22,8 @@ Definitions (documented in ``docs/DECISIONS.md``):
     * ``expiration_rate = expired / (paid + expired)`` for voucher methods only, the complement
       of ``completion_rate``.
     * ``refund_rate = n_refunded / approved``: the share of authorized transactions later refunded.
+    * ``abandonment_rate = n_expired / (attempts + n_expired)``, all methods: the customer never
+      completed the payment (an expired checkout session or an unpaid voucher).
     * A rate with a zero denominator is null, never 0 or NaN.
 """
 
@@ -186,6 +188,8 @@ def outcome_rates(lf: pl.LazyFrame, dims: Sequence[str]) -> pl.LazyFrame:
         ``expiration_rate = expired / voucher_attempts``
         ``refund_rate = sum(n_refunded) / approved``, where
             ``approved = sum(n_approved) + sum(n_refunded)``
+        ``abandonment_rate = sum(n_expired) / resolved``, all methods, where
+            ``resolved = attempts + sum(n_expired)``
         Each rate has a Wilson 95% interval in ``<rate>_wilson_low`` and ``<rate>_wilson_high``.
 
     Args:
@@ -196,7 +200,8 @@ def outcome_rates(lf: pl.LazyFrame, dims: Sequence[str]) -> pl.LazyFrame:
     Returns:
         ``dims`` followed by ``attempts``, ``declined``, ``decline_rate``, ``failed``,
         ``failure_rate``, ``voucher_attempts``, ``expired``, ``expiration_rate``, ``approved``,
-        ``refunded``, ``refund_rate`` and the Wilson bounds of the four rates, sorted by ``dims``.
+        ``refunded``, ``refund_rate``, ``resolved``, ``abandoned``, ``abandonment_rate`` and the
+        Wilson bounds of the five rates, sorted by ``dims``.
     """
     is_voucher = pl.col("payment_method").is_in(VOUCHER_METHODS)
     paid = pl.col("n_approved") + pl.col("n_refunded")
@@ -208,6 +213,10 @@ def outcome_rates(lf: pl.LazyFrame, dims: Sequence[str]) -> pl.LazyFrame:
         pl.col("n_expired").filter(is_voucher).sum().alias("expired"),
         paid.sum().alias("approved"),
         pl.col("n_refunded").sum().alias("refunded"),
+        (paid + pl.col("n_declined") + pl.col("n_failed") + pl.col("n_expired"))
+        .sum()
+        .alias("resolved"),
+        pl.col("n_expired").sum().alias("abandoned"),
     ]
     aggregated = lf.group_by(dims).agg(sums).sort(dims) if dims else lf.select(sums)
 
@@ -217,6 +226,7 @@ def outcome_rates(lf: pl.LazyFrame, dims: Sequence[str]) -> pl.LazyFrame:
         ("failed", "attempts", "failure_rate"),
         ("expired", "voucher_attempts", "expiration_rate"),
         ("refunded", "approved", "refund_rate"),
+        ("abandoned", "resolved", "abandonment_rate"),
     ):
         low, high = wilson_interval_expr(pl.col(successes), pl.col(n))
         columns += [
@@ -237,4 +247,7 @@ def outcome_rates(lf: pl.LazyFrame, dims: Sequence[str]) -> pl.LazyFrame:
         "approved",
         "refunded",
         pl.col("^refund_rate.*$"),
+        "resolved",
+        "abandoned",
+        pl.col("^abandonment_rate.*$"),
     )

@@ -243,6 +243,8 @@ def test_outcome_rates_split_declines_failures_and_voucher_expiration() -> None:
     assert card["decline_rate"] == pytest.approx(0.15)
     assert card["failure_rate"] == pytest.approx(0.05)
     assert card["refund_rate"] == pytest.approx(0.025)  # 2 refunded of 80 approved
+    assert card["resolved"] == 109  # 100 attempts + 9 expired sessions
+    assert card["abandonment_rate"] == pytest.approx(9 / 109)
     assert card["voucher_attempts"] == 0
     assert card["expiration_rate"] is None
     assert oxxo["voucher_attempts"] == 40  # 30 paid + 10 expired

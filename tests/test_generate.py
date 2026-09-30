@@ -247,7 +247,9 @@ def test_planted_anomalies_are_recoverable(dataset: Dataset) -> None:
     _, rows, raw_dir = dataset
     planted = json.loads((raw_dir / "planted_anomalies.json").read_text())
     anomalies = {anomaly["id"]: anomaly for anomaly in planted["anomalies"]}
-    assert set(anomalies) == {"a", "b", "c"}
+    assert set(anomalies) == {"a", "b", "c", "d", "e"}
+    assert anomalies["d"]["expected_diagnosis"] == "processing"
+    assert anomalies["e"]["expected_diagnosis"] == "ux"
     latest = list(_latest_by_transaction(rows).values())
 
     # a) PSP_C card declines in Colombia: spike days versus the other PSP_C days.

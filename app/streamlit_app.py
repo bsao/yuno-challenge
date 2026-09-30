@@ -30,6 +30,7 @@ import streamlit as st
 
 from analytics import anomalies, cost
 from analytics.health import COMPONENTS, merchant_health
+from analytics.health import MIN_ATTEMPTS as HEALTH_MIN_ATTEMPTS
 from analytics.metrics import performance
 from pipeline.transform import AGG_DAILY_FILE, FCT_FILE, aggregate_additive_measures
 
@@ -134,7 +135,7 @@ def load_anomalies(countries: tuple[str, ...]) -> dict[str, pl.DataFrame]:
 
 @st.cache_data
 def load_merchant_health(end: date, countries: tuple[str, ...]) -> pl.DataFrame:
-    """Score merchants on all history up to ``end`` for the selected countries."""
+    """Score merchants on the 30 days up to ``end`` for the selected countries."""
     fct = pl.scan_parquet(FCT_PATH).filter(
         (pl.col("local_date") <= end) & pl.col("country").is_in(list(countries))
     )
@@ -451,23 +452,54 @@ def render_failures(filters: Filters) -> None:
     heat = go.Figure(
         go.Heatmap(
             z=[[cell[metric] if cell else None for cell in row] for row in weekday_rows],
-            customdata=[[cell["attempts"] if cell else 0 for cell in row] for row in weekday_rows],
+            customdata=[
+                [
+                    [cell["attempts"], cell[f"{metric}_wilson_low"], cell[f"{metric}_wilson_high"]]
+                    if cell
+                    else [0, None, None]
+                    for cell in row
+                ]
+                for row in weekday_rows
+            ],
             x=hours,
             y=WEEKDAY_NAMES,
             colorscale=[[i / (len(SEQUENTIAL) - 1), c] for i, c in enumerate(SEQUENTIAL)],
             colorbar={"tickformat": ".0%"},
             xgap=2,
             ygap=2,
-            hovertemplate="%{y} %{x}:00<br>%{z:.1%}<br>n = %{customdata:,}<extra></extra>",
+            hovertemplate=(
+                "%{y} %{x}:00<br>%{z:.1%}<br>95% interval %{customdata[1]:.1%} to "
+                "%{customdata[2]:.1%}<br>n = %{customdata[0]:,}<extra></extra>"
+            ),
         )
     )
+    high = [cell for cell in grid.values() if cell[f"{metric}_is_high"]]
+    heat.add_trace(
+        go.Scatter(
+            x=[cell["local_hour"] for cell in high],
+            y=[WEEKDAY_NAMES[cell["local_weekday"] - 1] for cell in high],
+            mode="markers",
+            marker={
+                "symbol": "circle",
+                "size": 9,
+                "color": "white",
+                "line": {"color": INK, "width": 2},
+            },
+            name="Significantly above the overall rate",
+            hoverinfo="skip",
+            showlegend=True,
+        )
+    )
+    overall = next(iter(grid.values()))[f"overall_{metric}"] if grid else None
     heat.update_layout(title=f"{metric.replace('_', ' ').capitalize()} by local weekday and hour")
     heat.update_xaxes(title="Local hour", dtick=2, showgrid=False)
     heat.update_yaxes(autorange="reversed", showgrid=False)
     _show(
-        _style(heat, height=320),
-        "time PSP maintenance windows and on call cover; a dark cell is a recurring outage or "
-        "a fraud rule misfiring at a fixed hour.",
+        _style(heat, height=340),
+        f"time PSP maintenance windows and on call cover. Overall rate {_pct(overall)}; "
+        f"{len(high)} of {len(grid)} cells are marked, those whose interval stays above the "
+        f"overall rate after correcting for the number of cells. Unmarked differences in colour "
+        f"are within noise.",
     )
 
     amount = views["amount"]
@@ -696,14 +728,20 @@ def render_anomalies(filters: Filters) -> None:
 
 
 def render_health(filters: Filters) -> None:
-    """Render the ranked merchant health list with the main driver of each score."""
+    """Render the ranked merchant health list with the driver and diagnosis of each score."""
     _, end, countries = filters
     health = load_merchant_health(end, countries)
-    at_risk = health.filter(pl.col("label") == "at_risk").height
-    tiles = st.columns(3)
+    at_risk = health.filter(pl.col("label") == "at_risk")
+    tiles = st.columns(4)
     tiles[0].metric("Merchants scored", f"{health.height:,}")
-    tiles[1].metric("At risk (score below 50)", f"{at_risk:,}")
-    tiles[2].metric("Median score", f"{health.get_column('health_score').median():.0f}")
+    tiles[1].metric("At risk (score below 50)", f"{at_risk.height:,}")
+    tiles[2].metric(
+        "Processing / UX",
+        " / ".join(
+            str(at_risk.filter(pl.col("diagnosis") == kind).height) for kind in ("processing", "ux")
+        ),
+    )
+    tiles[3].metric("Median score", f"{health.get_column('health_score').median():.0f}")
     weights = ", ".join(f"{name} {weight:.0%}" for name, (weight, *_rest) in COMPONENTS.items())
     st.dataframe(
         health.select(
@@ -712,12 +750,17 @@ def render_health(filters: Filters) -> None:
             pl.col("merchant_category").alias("Category"),
             pl.col("health_score").round(1).alias("Score"),
             pl.col("label").alias("Label"),
+            pl.when(pl.col("label") == "at_risk")
+            .then(pl.col("diagnosis"))
+            .otherwise(pl.lit(""))
+            .alias("Diagnosis"),
             pl.col("main_driver").alias("Main driver"),
-            pl.col("attempts").alias("Attempts"),
+            pl.col("attempts").alias("Attempts (30 days)"),
             (pl.col("auth_gap") * 100).round(1).alias("Auth vs peers (pts)"),
+            (pl.col("abandonment_gap") * 100).round(1).alias("Abandonment vs peers (pts)"),
+            (pl.col("volume_trend") * 100).round(0).alias("Volume vs prior 30 days %"),
             (pl.col("failure_rate") * 100).round(1).alias("Failure rate %"),
             (pl.col("refund_rate") * 100).round(1).alias("Refund rate %"),
-            (pl.col("volume_trend") * 100).round(0).alias("30 day volume %"),
         ),
         hide_index=True,
         column_config={
@@ -725,11 +768,12 @@ def render_health(filters: Filters) -> None:
         },
     )
     st.caption(
-        f"Decision: which merchants an account manager calls first, and about what. Ranked "
-        f"worst first. Score = weighted sum of four components ({weights}); the main driver is "
-        f"the component costing the most points. Rates use all history up to the end date; "
-        f"volume compares the last 30 days with the 30 before. Read scores of merchants with few "
-        f"attempts with caution."
+        f"Decision: which merchants an account manager calls first, and whether to bring the "
+        f"payments team (processing: refusals and errors) or the product team (ux: customers "
+        f"abandon or stop coming). Ranked worst first, on the 30 days up to the end date. Score "
+        f"= weighted sum of five components ({weights}); the main driver is the component "
+        f"costing the most points. Merchants with fewer than {HEALTH_MIN_ATTEMPTS} attempts are "
+        f"labelled insufficient_data."
     )
 
 

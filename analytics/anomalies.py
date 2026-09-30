@@ -37,6 +37,7 @@ from analytics.metrics import (
     NOT_APPROVED_STATUSES,
     outcome_rates,
     performance,
+    wilson_interval_expr,
 )
 from pipeline.transform import aggregate_additive_measures
 
@@ -50,6 +51,8 @@ MIN_HOURLY_ATTEMPTS = 20
 MIN_HOURLY_EVENTS = 10
 MIN_MERCHANT_ATTEMPTS = 50
 PEER_MARGIN = 0.10
+# One sided normal quantile for 0.05 / 168: Bonferroni correction for the 7 x 24 heatmap cells.
+HEATMAP_Z = 3.43
 
 DAILY_SEGMENT: tuple[str, ...] = ("psp", "country", "payment_method")
 HOURLY_SEGMENT: tuple[str, ...] = ("psp", "country")
@@ -128,18 +131,42 @@ def reason_breakdown(fct: pl.LazyFrame) -> pl.LazyFrame:
 
 
 def decline_heatmap(fct: pl.LazyFrame, dims: Sequence[str] = ()) -> pl.LazyFrame:
-    """Compute decline and failure rates per local weekday and hour.
+    """Compute decline and failure rates per local weekday and hour, and mark the high cells.
 
     Grain: one row per ``dims`` x ``local_weekday`` (ISO, 1 is Monday) x ``local_hour``.
+
+    Formulas, for each of ``decline_rate`` and ``failure_rate``:
+        ``overall_<rate>`` = the pooled rate over all cells of the same ``dims``
+        ``<rate>_is_high`` = the Wilson lower bound of the cell at ``z = 3.43`` is above
+            ``overall_<rate>``. 3.43 is the one sided normal quantile for 0.05 / 168, a
+            Bonferroni correction for the 168 cells, so that across the whole heatmap the
+            chance of marking any cell by luck stays near 5%.
 
     Args:
         fct: One row per transaction.
         dims: Extra columns to split the heatmap by, for example ``["country"]``.
 
     Returns:
-        The columns of ``analytics.metrics.outcome_rates`` at that grain.
+        The columns of ``analytics.metrics.outcome_rates`` at that grain (with their Wilson 95%
+        bounds), plus ``overall_decline_rate``, ``overall_failure_rate``,
+        ``decline_rate_is_high`` and ``failure_rate_is_high``.
     """
-    return _outcome_rates_by(fct, [*dims, "local_weekday", "local_hour"])
+    rates = _outcome_rates_by(fct, [*dims, "local_weekday", "local_hour"])
+    group = list(dims)
+
+    def pooled(column: str) -> pl.Expr:
+        total = pl.col(column).sum()
+        return total.over(group) if group else total
+
+    flags: list[pl.Expr] = []
+    for events, rate in (("declined", "decline_rate"), ("failed", "failure_rate")):
+        overall = pooled(events) / pooled("attempts")
+        strict_low, _ = wilson_interval_expr(pl.col(events), pl.col("attempts"), z=HEATMAP_Z)
+        flags += [
+            overall.alias(f"overall_{rate}"),
+            (strict_low > overall).fill_null(False).alias(f"{rate}_is_high"),
+        ]
+    return rates.with_columns(flags)
 
 
 def decline_rate_by_amount_bucket(fct: pl.LazyFrame, dims: Sequence[str] = ()) -> pl.LazyFrame:

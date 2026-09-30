@@ -26,6 +26,8 @@ in [ANALYSIS.md](ANALYSIS.md).
 | 8 | Validation | Every Makefile target run from a fresh clone; one defect fixed | below |
 | 9 | Brazil | BRL, PIX and Boleto added end to end; every step re-verified | ADR 6 |
 | 10 | Documentation | README, ADRs, and a CFO memo generated from the marts | |
+| 11 | Realistic merchant health | Two planted merchant problems; a 30 day score with a processing or ux diagnosis; significance marks on the heatmap | ADR 8 |
+| 12 | Reviewer pass | Clean clone, README followed literally, scored against the rubric | below |
 
 A first generator, built before the specification of step 2 arrived, was replaced by it.
 
@@ -33,29 +35,32 @@ A first generator, built before the specification of step 2 arrived, was replace
 
 Each number was computed twice, through code paths that share nothing. The independent path reads
 the raw files with the standard `json` and `csv` modules, or staging with eager Polars, and uses no
-mart and no `analytics` code. Values are for the current dataset, including Brazil.
+mart and no `analytics` code. Values are for the final dataset. The difference is zero in every
+row, at the precision shown.
 
 | Step | Number | Pipeline value | Independent value |
 | --- | --- | --- | --- |
-| 2 | Deliveries and duplicates | 2,429,420 and 23,765 | 2,429,420 and 23,765 |
-| 3 | Unique events | 2,405,655 | 2,405,655 |
-| 3 | Out of order events | 32,272 | 32,272 |
+| 2 | Deliveries and duplicates | 2,429,071 and 23,950 | 2,429,071 and 23,950 |
+| 3 | Unique events | 2,405,121 | 2,405,121 |
+| 3 | Out of order events | 32,520 | 32,520 |
 | 3 | Transactions | 1,200,000 | 1,200,000 |
-| 3 | Approved / declined / failed | 885,346 / 193,737 / 33,707 | 885,346 / 193,737 / 33,707 |
-| 3 | Approved amount (USD) | 38,457,571.15 | 38,457,571.15 |
-| 4 | Colombia card authorization rate | 71.0288% | 71.0288% |
-| 4 | Brazil Boleto completion rate | 59.6446% | 59.6446% |
-| 5 | z of the PSP_C decline spike, 2026-09-01 | 8.6024 | 8.6024 |
-| 5 | z of the PSP_B timeout, 2026-09-12 02:00 | 27.685 | 27.685 |
-| 5 | `mrc_058` completion and peer rate | 4.07% and 63.53% | 4.07% and 63.53% |
-| 7 | Health score of the lowest merchant, `mrc_113` | 58.6883 | 58.6883 |
-| 7 | Cost per sale, PSP_C and PSP_D, Colombia cards | $1.4166 and $0.9786 | $1.4166 and $0.9786 |
-| 7 | Mexico cards shift: fee savings and GMV per month | $1,691.52 and -$19,014.96 | $1,691.52 and -$19,014.96 |
-| 6 | Dashboard tiles read from the container | 1,129,756; 79.9%; $39,204,592; $38,457,571 | 1,129,756; 79.9%; $39,204,592; $38,457,571 |
+| 3 | Approved / declined / failed | 877,237 / 199,768 / 34,917 | 877,237 / 199,768 / 34,917 |
+| 3 | Approved amount (USD) | 38,100,605.41 | 38,100,605.41 |
+| 4 | Colombia card authorization rate | 71.0460% | 71.0460% |
+| 4 | Brazil Boleto completion rate | 58.8756% | 58.8756% |
+| 5 | z of the PSP_C decline spike, 2026-09-01 | 5.3461 | 5.3461 |
+| 5 | z of the PSP_B timeout, 2026-09-12 02:00 | 33.300 | 33.300 |
+| 5 | `mrc_058` completion and peer rate | 4.60% and 63.50% | 4.60% and 63.50% |
+| 7 | Cost per sale, PSP_C and PSP_D, Colombia cards | $1.4110 and $0.9979 | $1.4110 and $0.9979 |
+| 7 | Mexico cards shift: fee savings and GMV per month | $1,729.95 and -$20,681.41 | $1,729.95 and -$20,681.41 |
+| 11 | Health score of the lowest merchant, `mrc_030` | 34.7970 | 34.7970 |
+| 10 | Memo: net GMV, unpaid vouchers, one card point, per month | $12,700,202; $681,757; $105,358 | $12,700,202; $681,757; $105,358 |
+| 6 | Dashboard tiles read from the container | 1,128,578; 79.2%; $38,833,029; $38,100,605 | 1,128,578; 79.2%; $38,833,029; $38,100,605 |
 
-Detection result: the hourly rule raises 4 flags and the merchant rule 1, exactly the planted
-outage and merchant. The daily rule raises 13 flags: the 3 planted days, which are the 3 strongest,
-and 10 isolated chance flags (ADR 5).
+Detection result: every planted anomaly is detected by the rule designed for it. Merchant health
+labels exactly the two planted merchants at risk, with the planted diagnoses. The peer rule flags
+the voucher merchant and the processing merchant, nobody else. The hourly rule flags 3 of the 4
+outage hours and nothing else. The daily rule raises 33 flags, of which 3 are chance (ADR 5).
 
 ## Step 8: validation from a fresh clone
 
@@ -89,12 +94,24 @@ The original requirement lists PIX and Boleto for Brazil; the first build covere
 - Found on review: with more segments the daily anomaly rule raises chance flags. The planted
   anomaly test now asserts that the planted days are flagged and are the strongest flags.
 
+## Step 11: realistic merchant health
+
+The first health score labelled every merchant healthy, because the data held no merchant problem
+and the score averaged three months. Changed:
+
+- Generator: a Brazilian merchant whose payments are refused and fail (processing) and a Chilean
+  merchant whose customers abandon checkout and whose volume halves (experience), both in the last
+  30 days.
+- Score: rates on the last 30 days only; abandonment against peers added as a component; a
+  diagnosis derived from the main driver; merchants with too few attempts are not labelled.
+- Heatmap: a cell is marked only when it is above the overall rate after a Bonferroni correction
+  for the 168 cells. One cell is marked, Saturday 02:00 on failure rate: the planted outage.
+
 ## Open items
 
 | Item | Status |
 | --- | --- |
-| Merchant problems, UX or processing | The dataset plants no merchant decline over time; the health score labels every merchant healthy and has no voucher completion component |
-| Daily anomaly threshold | z >= 3 as specified gives 10 chance flags; z >= 5 would leave only the incident |
-| Wilson interval on every rate | Missing on the weekday by hour heatmap cells |
-| Memory | Pipeline and `make check` need about 2.4 GB at the default scale |
+| Daily anomaly threshold | z >= 3 as specified is noisy and cannot separate a PSP from a large merchant; see ADR 5 |
+| Health weights | Judgement, not fitted; no churn label exists |
+| Memory | Pipeline and `make check` need about 2.4 GB at the default scale; documented in the README |
 | Commit history | Some commit subjects do not follow Conventional Commits |

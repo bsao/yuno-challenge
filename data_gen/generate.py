@@ -1,7 +1,7 @@
 """Synthetic webhook generator and CLI entry point.
 
 Purpose: produce deterministic, realistic Yuno transaction webhooks for TiendaMax, with duplicated
-    and out of order events and three planted anomalies the analytics layer must recover.
+    and out of order events and five planted anomalies the analytics layer must recover.
 Inputs: a ``GeneratorConfig`` (seed, transaction count, window, output directory), usually from
     the CLI.
 Outputs (all under ``config.output_dir``, by default ``data/raw``):
@@ -196,6 +196,18 @@ TIMEOUT_SPIKE_COUNTRY = "MX"
 TIMEOUT_SPIKE_EARLIEST_DAY = 66
 TIMEOUT_SPIKE_LOCAL_HOURS: tuple[int, ...] = (2, 3)  # 02:00 to 03:59 local time
 TIMEOUT_SPIKE_FAILURE_SHIFT = 0.60
+# Merchant level problems, both active during the last days of the window.
+MERCHANT_ISSUE_LAST_DAYS = 30
+# d) Processing: one merchant's payments are refused and error far more often.
+PROCESSING_ISSUE_COUNTRY = "BR"
+PROCESSING_ISSUE_MERCHANT_RANK = 1  # second largest Brazilian merchant
+PROCESSING_ISSUE_DECLINE_SHIFT = 0.30
+PROCESSING_ISSUE_FAILURE_SHIFT = 0.06
+# e) Checkout experience: one merchant's customers abandon the payment and its volume halves.
+UX_ISSUE_COUNTRY = "CL"
+UX_ISSUE_MERCHANT_RANK = 0  # largest Chilean merchant
+UX_ISSUE_EXPIRED_SHIFT = 0.25
+UX_ISSUE_VOLUME_LOSS = 0.50
 
 # Delivery behaviour.
 DUPLICATE_SHARE = 0.01
@@ -255,6 +267,8 @@ class _Merchants:
     category: IntArray
     size_tier: list[str]
     oxxo_expiry_merchant: int
+    processing_issue_merchant: int
+    ux_issue_merchant: int
 
 
 @dataclass(frozen=True)
@@ -343,10 +357,20 @@ def _sample_merchants(rng: np.random.Generator) -> _Merchants:
     rank[np.argsort(-weight)] = np.arange(MERCHANT_COUNT)
     size_tier = [next(name for name, limit in SIZE_TIERS if r < limit) for r in rank.tolist()]
 
-    in_country = np.flatnonzero(country == COUNTRIES.index(OXXO_EXPIRY_COUNTRY))
-    by_volume = in_country[np.argsort(-weight[in_country])]
-    oxxo_expiry_merchant = int(by_volume[min(OXXO_EXPIRY_MERCHANT_RANK, len(by_volume) - 1)])
-    return _Merchants(country, weight, category, size_tier, oxxo_expiry_merchant)
+    def ranked(country_name: str, position: int) -> int:
+        in_country = np.flatnonzero(country == COUNTRIES.index(country_name))
+        by_volume = in_country[np.argsort(-weight[in_country])]
+        return int(by_volume[min(position, len(by_volume) - 1)])
+
+    return _Merchants(
+        country,
+        weight,
+        category,
+        size_tier,
+        oxxo_expiry_merchant=ranked(OXXO_EXPIRY_COUNTRY, OXXO_EXPIRY_MERCHANT_RANK),
+        processing_issue_merchant=ranked(PROCESSING_ISSUE_COUNTRY, PROCESSING_ISSUE_MERCHANT_RANK),
+        ux_issue_merchant=ranked(UX_ISSUE_COUNTRY, UX_ISSUE_MERCHANT_RANK),
+    )
 
 
 def _sample_transactions(
@@ -362,6 +386,15 @@ def _sample_transactions(
 
     weekday = np.asarray([config.day_date(day).weekday() for day in range(config.days)])
     day = _choose(rng, np.asarray(WEEKDAY_WEIGHTS)[weekday].tolist(), n)
+    # Planted anomaly e, volume part: the merchant loses half of its recent transactions, which
+    # are moved to earlier days so the transaction count stays exact.
+    issue_start = max(config.days - MERCHANT_ISSUE_LAST_DAYS, 1)
+    lost = (
+        (merchant == merchants.ux_issue_merchant)
+        & (day >= issue_start)
+        & (rng.random(n) < UX_ISSUE_VOLUME_LOSS)
+    )
+    day[lost] = rng.integers(0, issue_start, size=int(lost.sum()))
     local_hour = _choose(rng, HOUR_WEIGHTS, n)
     local_ms = day * MS_PER_DAY + local_hour * MS_PER_HOUR + _uniform_ms(rng, (0, MS_PER_HOUR), n)
     created_ms = start_ms + local_ms - _utc_offset_hours(config)[country, day] * MS_PER_HOUR
@@ -430,6 +463,13 @@ def _sample_transactions(
         & np.isin(local_hour, TIMEOUT_SPIKE_LOCAL_HOURS)
     )
     _shift(probs, timeout_spike, APPROVED, FAILED, TIMEOUT_SPIKE_FAILURE_SHIFT)
+    # Planted anomaly d: a processing problem at one merchant during the last days.
+    processing_issue = (merchant == merchants.processing_issue_merchant) & (day >= issue_start)
+    _shift(probs, processing_issue, APPROVED, DECLINED, PROCESSING_ISSUE_DECLINE_SHIFT)
+    _shift(probs, processing_issue, APPROVED, FAILED, PROCESSING_ISSUE_FAILURE_SHIFT)
+    # Planted anomaly e, abandonment part: customers leave the checkout, so sessions expire.
+    ux_issue = (merchant == merchants.ux_issue_merchant) & (day >= issue_start)
+    _shift(probs, ux_issue, APPROVED, EXPIRED, UX_ISSUE_EXPIRED_SHIFT)
 
     thresholds = probs.cumsum(axis=1)[:, :4]
     outcome = (rng.random(n)[:, None] > thresholds).sum(axis=1).astype(np.int64)
@@ -512,6 +552,7 @@ def _write_reference_files(config: GeneratorConfig, merchants: _Merchants) -> No
 
     spike_first = config.day_date(DECLINE_SPIKE_FIRST_DAY)
     saturday, sunday = (config.day_date(day) for day in _timeout_spike_days(config))
+    issue_start = config.day_date(max(config.days - MERCHANT_ISSUE_LAST_DAYS, 1))
     planted = {
         "window": {
             "start_date": config.start_date.isoformat(),
@@ -551,6 +592,24 @@ def _write_reference_files(config: GeneratorConfig, merchants: _Merchants) -> No
                 "local_hours": list(TIMEOUT_SPIKE_LOCAL_HOURS),
                 "decline_reason": "network_timeout",
                 "added_failure_probability": TIMEOUT_SPIKE_FAILURE_SHIFT,
+            },
+            {
+                "id": "d",
+                "type": "merchant_processing_issue",
+                "description": "One merchant's payments are declined and fail far more often.",
+                "merchant_id": _merchant_id(merchants.processing_issue_merchant),
+                "country": PROCESSING_ISSUE_COUNTRY,
+                "start_date": issue_start.isoformat(),
+                "expected_diagnosis": "processing",
+            },
+            {
+                "id": "e",
+                "type": "merchant_ux_issue",
+                "description": "One merchant's customers abandon checkout and its volume halves.",
+                "merchant_id": _merchant_id(merchants.ux_issue_merchant),
+                "country": UX_ISSUE_COUNTRY,
+                "start_date": issue_start.isoformat(),
+                "expected_diagnosis": "ux",
             },
         ],
     }

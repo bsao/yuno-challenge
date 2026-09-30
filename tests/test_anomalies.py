@@ -16,6 +16,7 @@ import polars as pl
 import pytest
 
 from analytics import anomalies
+from analytics.health import merchant_health
 from pipeline.run import run_pipeline
 
 START = date(2026, 9, 1)
@@ -217,6 +218,29 @@ def test_heatmap_has_one_row_per_weekday_and_hour() -> None:
     assert result.select("local_weekday", "local_hour").rows() == [(1, 2), (5, 20)]
     assert result.get_column("attempts").to_list() == [2, 1]
     assert result.get_column("decline_rate").to_list() == pytest.approx([0.5, 0.0])
+    assert result.get_column("overall_decline_rate").to_list() == pytest.approx([1 / 3, 1 / 3])
+    assert result.get_column("decline_rate_is_high").to_list() == [False, False]  # tiny samples
+
+
+def test_heatmap_marks_only_cells_clearly_above_the_overall_rate() -> None:
+    """Overall 300 of 3,000 is 10%: a cell at 40% of 500 is marked, one at 12% of 500 is not."""
+    fct = _transactions(
+        [
+            {"local_weekday": 6, "local_hour": 3, "final_status": "declined", "n": 200},
+            {"local_weekday": 6, "local_hour": 3, "final_status": "approved", "n": 300},
+            {"local_weekday": 2, "local_hour": 9, "final_status": "declined", "n": 60},
+            {"local_weekday": 2, "local_hour": 9, "final_status": "approved", "n": 440},
+            {"local_weekday": 3, "local_hour": 15, "final_status": "declined", "n": 40},
+            {"local_weekday": 3, "local_hour": 15, "final_status": "approved", "n": 1960},
+        ]
+    )
+
+    result = anomalies.decline_heatmap(fct).collect().sort("local_weekday")
+
+    assert result.get_column("overall_decline_rate").to_list() == pytest.approx([0.1] * 3)
+    assert result.get_column("decline_rate").to_list() == pytest.approx([0.12, 0.02, 0.40])
+    # 60 of 500 at z = 3.43: lower bound 0.079, below 10%. 200 of 500: lower bound 0.328.
+    assert result.get_column("decline_rate_is_high").to_list() == [False, False, True]
 
 
 def test_voucher_expiration_by_merchant_uses_resolved_vouchers_only() -> None:
@@ -300,10 +324,10 @@ def full_scale_data(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 def test_every_planted_anomaly_is_detected(full_scale_data: Path) -> None:
-    """Every planted anomaly is flagged, and the planted flags are the strongest."""
+    """Every planted anomaly is detected by the rule designed for it."""
     planted = json.loads((full_scale_data / "raw" / "planted_anomalies.json").read_text())
     by_id = {anomaly["id"]: anomaly for anomaly in planted["anomalies"]}
-    assert set(by_id) == {"a", "b", "c"}
+    assert set(by_id) == {"a", "b", "c", "d", "e"}
     fct = pl.scan_parquet(full_scale_data / "marts" / "fct_transactions.parquet")
     agg_daily = pl.scan_parquet(full_scale_data / "marts" / "agg_daily.parquet")
 
@@ -320,48 +344,45 @@ def test_every_planted_anomaly_is_detected(full_scale_data: Path) -> None:
         for offset in range((last - first).days + 1)
     }
     daily_flags = (
-        anomalies.score_daily_decline_rate(agg_daily)
-        .filter(pl.col("is_anomaly"))
-        .sort("z", descending=True)
-        .collect()
+        anomalies.score_daily_decline_rate(agg_daily).filter(pl.col("is_anomaly")).collect()
     )
-    flagged_days = daily_flags.select("date", "psp", "country", "payment_method").rows()
-    # At z >= 3 the daily rule also raises a few chance flags; the planted days are the
-    # strongest ones.
-    assert expected_days <= set(flagged_days)
-    assert set(flagged_days[: len(expected_days)]) == expected_days
+    flagged_days = set(daily_flags.select("date", "psp", "country", "payment_method").rows())
+    # The daily rule also flags the segments hit by the planted merchant problem (anomaly d)
+    # and a few chance days, so the planted days must be among the flags, not the only ones.
+    assert expected_days <= flagged_days
 
-    # b) Voucher expiration: the planted merchant is flagged on its completion rate.
-    voucher = by_id["b"]
+    # b) and d) Merchants against peers: the voucher merchant on completion, the processing
+    # merchant on authorization, and nobody else.
+    voucher, processing = by_id["b"], by_id["d"]
     merchant_flags = (
         anomalies.score_merchants_against_peers(fct).filter(pl.col("is_anomaly")).collect()
     )
-    assert merchant_flags.select("merchant_id", "metric").rows() == [
-        (voucher["merchant_id"], "completion_rate")
-    ]
+    assert set(merchant_flags.select("merchant_id", "metric").rows()) == {
+        (voucher["merchant_id"], "completion_rate"),
+        (processing["merchant_id"], "auth_rate"),
+    }
     worst = anomalies.voucher_expiration_by_merchant(fct).collect().row(0, named=True)
     assert worst["merchant_id"] == voucher["merchant_id"]
     assert worst["expiration_rate"] == pytest.approx(voucher["expected_expiration_rate"], abs=0.03)
 
-    # c) Timeout spike: every planted date and hour is flagged for the planted PSP and reason.
+    # c) Timeout spike: every flag is a planted slot and every planted night is detected. A slot
+    # with fewer than 20 attempts or 10 events is below the rule's minimum sample.
     timeout = by_id["c"]
-    expected_slots = {
-        (
-            timeout["psp"],
-            timeout["country"],
-            date.fromisoformat(day),
-            hour,
-            timeout["decline_reason"],
-        )
-        for day in timeout["dates"]
-        for hour in timeout["local_hours"]
-    }
+    planted_nights = {date.fromisoformat(day) for day in timeout["dates"]}
     hourly_flags = anomalies.score_hourly_reason_rate(fct).filter(pl.col("is_anomaly")).collect()
-    assert (
-        set(
-            hourly_flags.select(
-                "psp", "country", "local_date", "local_hour", "decline_reason"
-            ).rows()
-        )
-        == expected_slots
-    )
+    for psp, country, night, hour, reason in hourly_flags.select(
+        "psp", "country", "local_date", "local_hour", "decline_reason"
+    ).rows():
+        assert (psp, country, reason) == (timeout["psp"], timeout["country"], "network_timeout")
+        assert night in planted_nights
+        assert hour in timeout["local_hours"]
+    assert set(hourly_flags.get_column("local_date").to_list()) == planted_nights
+
+    # d) and e) Merchant health: exactly the two planted merchants are at risk, each with the
+    # planted diagnosis.
+    ux = by_id["e"]
+    at_risk = merchant_health(fct).filter(pl.col("label") == "at_risk").collect()
+    assert dict(at_risk.select("merchant_id", "diagnosis").rows()) == {
+        processing["merchant_id"]: processing["expected_diagnosis"],
+        ux["merchant_id"]: ux["expected_diagnosis"],
+    }
