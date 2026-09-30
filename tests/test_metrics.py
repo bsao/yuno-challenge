@@ -18,7 +18,12 @@ Hand computation of the Wilson interval (z = 1.96, z**2 = 3.8416):
 import polars as pl
 import pytest
 
-from analytics.metrics import performance, wilson_interval, wilson_interval_expr
+from analytics.metrics import (
+    outcome_rates,
+    performance,
+    wilson_interval,
+    wilson_interval_expr,
+)
 
 TOLERANCE = 1e-5
 WILSON_CASES = [
@@ -56,7 +61,10 @@ def test_wilson_interval_matches_hand_computed_values(
 def test_wilson_interval_expr_matches_hand_computed_values() -> None:
     """The Polars Wilson expressions reproduce the same hand computed bounds."""
     frame = pl.DataFrame(
-        {"successes": [case[0] for case in WILSON_CASES], "n": [case[1] for case in WILSON_CASES]}
+        {
+            "successes": [case[0] for case in WILSON_CASES],
+            "n": [case[1] for case in WILSON_CASES],
+        }
     )
     low, high = wilson_interval_expr(pl.col("successes"), pl.col("n"))
 
@@ -73,7 +81,9 @@ def test_wilson_interval_expr_matches_hand_computed_values() -> None:
 def test_wilson_interval_is_null_without_trials_and_rejects_invalid_input() -> None:
     """Zero trials give null bounds in Polars and an error in the scalar function."""
     low, high = wilson_interval_expr(pl.col("successes"), pl.col("n"))
-    result = pl.DataFrame({"successes": [0], "n": [0]}).select(low.alias("low"), high.alias("high"))
+    result = pl.DataFrame({"successes": [0], "n": [0]}).select(
+        low.alias("low"), high.alias("high")
+    )
     assert result.row(0) == (None, None)
 
     with pytest.raises(ValueError, match="invalid proportion"):
@@ -82,7 +92,9 @@ def test_wilson_interval_is_null_without_trials_and_rejects_invalid_input() -> N
         wilson_interval(11, 10)
 
 
-def test_auth_rate_counts_refunded_as_approved_and_excludes_pending_and_expired() -> None:
+def test_auth_rate_counts_refunded_as_approved_and_excludes_pending_and_expired() -> (
+    None
+):
     """70 approved + 5 refunded over 100 attempts is 75%; 7 pending and 9 expired are ignored."""
     lf = _measures(
         [
@@ -111,8 +123,18 @@ def test_auth_rate_is_recomputed_from_counts_when_rolling_up() -> None:
     """Rolling up sums the counts: (8 + 42) / (10 + 90) = 50%, not the 63.3% mean of rates."""
     lf = _measures(
         [
-            {"country": "MX", "payment_method": "card", "n_approved": 8, "n_declined": 2},
-            {"country": "MX", "payment_method": "spei", "n_approved": 42, "n_declined": 48},
+            {
+                "country": "MX",
+                "payment_method": "card",
+                "n_approved": 8,
+                "n_declined": 2,
+            },
+            {
+                "country": "MX",
+                "payment_method": "spei",
+                "n_approved": 42,
+                "n_declined": 48,
+            },
             {"country": "CL", "payment_method": "card", "n_approved": 10},
         ]
     )
@@ -144,7 +166,11 @@ def test_gmv_is_gross_and_net_gmv_subtracts_refunds() -> None:
     """Gross GMV is 1,000 + 50 = 1,050 USD; net GMV is 1,050 - 50 = 1,000 USD."""
     lf = _measures(
         [
-            {"payment_method": "card", "approved_amount_usd": 600.0, "refunded_amount_usd": 50.0},
+            {
+                "payment_method": "card",
+                "approved_amount_usd": 600.0,
+                "refunded_amount_usd": 50.0,
+            },
             {"payment_method": "spei", "approved_amount_usd": 400.0},
         ]
     )
@@ -167,7 +193,12 @@ def test_completion_rate_applies_to_voucher_methods_only() -> None:
                 "n_failed": 1,
                 "n_pending": 4,
             },
-            {"payment_method": "card", "n_approved": 80, "n_declined": 20, "n_expired": 5},
+            {
+                "payment_method": "card",
+                "n_approved": 80,
+                "n_declined": 20,
+                "n_expired": 5,
+            },
         ]
     )
 
@@ -176,7 +207,9 @@ def test_completion_rate_applies_to_voucher_methods_only() -> None:
 
     assert oxxo["voucher_attempts"] == 100  # 62 paid + 38 expired
     assert oxxo["completion_rate"] == pytest.approx(0.62)
-    assert oxxo["auth_rate"] == pytest.approx(62 / 63)  # expired is not an authorization attempt
+    assert oxxo["auth_rate"] == pytest.approx(
+        62 / 63
+    )  # expired is not an authorization attempt
     assert card["voucher_attempts"] == 0
     assert card["completion_rate"] is None
     assert card["completion_wilson_low"] is None
@@ -186,3 +219,47 @@ def test_completion_rate_applies_to_voucher_methods_only() -> None:
     assert total["voucher_attempts"] == 100
     assert total["completion_rate"] == pytest.approx(0.62)
     assert total["attempts"] == 163  # 63 oxxo + 100 card
+
+
+def test_outcome_rates_split_declines_failures_and_voucher_expiration() -> None:
+    """Of 100 card attempts 15 decline and 5 fail; of 40 resolved vouchers 10 expire."""
+    lf = _measures(
+        [
+            {
+                "payment_method": "card",
+                "n_approved": 78,
+                "n_refunded": 2,
+                "n_declined": 15,
+                "n_failed": 5,
+                "n_expired": 9,
+            },
+            {
+                "payment_method": "oxxo",
+                "n_approved": 29,
+                "n_refunded": 1,
+                "n_expired": 10,
+            },
+        ]
+    )
+
+    by_method = outcome_rates(lf, ["payment_method"]).collect()
+    card, oxxo = by_method.row(0, named=True), by_method.row(1, named=True)
+
+    assert card["attempts"] == 100  # 78 + 2 + 15 + 5; the 9 expired are not attempts
+    assert card["decline_rate"] == pytest.approx(0.15)
+    assert card["failure_rate"] == pytest.approx(0.05)
+    assert card["voucher_attempts"] == 0
+    assert card["expiration_rate"] is None
+    assert oxxo["voucher_attempts"] == 40  # 30 paid + 10 expired
+    assert oxxo["expiration_rate"] == pytest.approx(0.25)
+    assert oxxo["decline_rate"] == pytest.approx(0.0)
+
+    total = outcome_rates(lf, []).collect().row(0, named=True)
+    assert total["attempts"] == 130
+    assert total["decline_rate"] == pytest.approx(15 / 130)
+    assert total["expiration_rate"] == pytest.approx(0.25)  # voucher rows only
+    # Wilson bounds of 10 of 40 by the scalar reference.
+    assert (
+        total["expiration_rate_wilson_low"],
+        total["expiration_rate_wilson_high"],
+    ) == (pytest.approx(wilson_interval(10, 40)))

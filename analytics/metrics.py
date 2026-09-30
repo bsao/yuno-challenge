@@ -17,6 +17,10 @@ Definitions (documented in ``docs/DECISIONS.md``):
     * ``net_gmv_usd = gmv_usd - refunded_amount_usd``.
     * ``completion_rate = paid / (paid + expired)`` for voucher methods only, where
       ``paid = n_approved + n_refunded``.
+    * ``decline_rate = n_declined / attempts`` and ``failure_rate = n_failed / attempts``: the
+      two ways an attempt is not approved (issuer or risk refusal versus technical error).
+    * ``expiration_rate = expired / (paid + expired)`` for voucher methods only, the complement
+      of ``completion_rate``.
     * A rate with a zero denominator is null, never 0 or NaN.
 """
 
@@ -28,6 +32,10 @@ import polars as pl
 # Two sided 95% confidence.
 WILSON_Z = 1.96
 VOUCHER_METHODS: tuple[str, ...] = ("oxxo",)
+# Final statuses that count as an authorization attempt, split by outcome.
+APPROVED_STATUSES: tuple[str, ...] = ("approved", "refunded")
+NOT_APPROVED_STATUSES: tuple[str, ...] = ("declined", "failed")
+ATTEMPT_STATUSES: tuple[str, ...] = APPROVED_STATUSES + NOT_APPROVED_STATUSES
 
 
 def wilson_interval(successes: int, n: int, z: float = WILSON_Z) -> tuple[float, float]:
@@ -124,7 +132,8 @@ def performance(lf: pl.LazyFrame, dims: Sequence[str]) -> pl.LazyFrame:
 
     Returns:
         ``dims`` followed by ``attempts``, ``approved``, ``auth_rate``, ``wilson_low``,
-        ``wilson_high``, ``gmv_usd``, ``net_gmv_usd``, ``voucher_attempts``, ``completion_rate``,
+        ``wilson_high``, ``gmv_usd``, ``net_gmv_usd``, ``voucher_attempts``, ``voucher_paid``,
+        ``completion_rate``,
         ``completion_wilson_low`` and ``completion_wilson_high``, sorted by ``dims``.
     """
     is_voucher = pl.col("payment_method").is_in(VOUCHER_METHODS)
@@ -144,7 +153,9 @@ def performance(lf: pl.LazyFrame, dims: Sequence[str]) -> pl.LazyFrame:
     wilson_low, wilson_high = wilson_interval_expr(approved, attempts)
     voucher_paid = pl.col("_voucher_paid")
     voucher_attempts = voucher_paid + pl.col("_voucher_expired")
-    completion_low, completion_high = wilson_interval_expr(voucher_paid, voucher_attempts)
+    completion_low, completion_high = wilson_interval_expr(
+        voucher_paid, voucher_attempts
+    )
     return aggregated.select(
         *dims,
         attempts.alias("attempts"),
@@ -155,7 +166,68 @@ def performance(lf: pl.LazyFrame, dims: Sequence[str]) -> pl.LazyFrame:
         (pl.col("net_gmv_usd") + pl.col("_refunded_usd")).alias("gmv_usd"),
         pl.col("net_gmv_usd"),
         voucher_attempts.alias("voucher_attempts"),
+        voucher_paid.alias("voucher_paid"),
         rate_expr(voucher_paid, voucher_attempts).alias("completion_rate"),
         completion_low.alias("completion_wilson_low"),
         completion_high.alias("completion_wilson_high"),
+    )
+
+
+def outcome_rates(lf: pl.LazyFrame, dims: Sequence[str]) -> pl.LazyFrame:
+    """Compute how attempts fail, per combination of ``dims``.
+
+    Grain: one row per combination of ``dims`` (a single row when ``dims`` is empty).
+
+    Formulas:
+        ``attempts = sum(n_approved) + sum(n_refunded) + sum(n_declined) + sum(n_failed)``
+        ``decline_rate = sum(n_declined) / attempts``
+        ``failure_rate = sum(n_failed) / attempts``
+        ``voucher_attempts = paid + expired`` over voucher method rows only, where
+            ``paid = n_approved + n_refunded``
+        ``expiration_rate = expired / voucher_attempts``
+        Each rate has a Wilson 95% interval in ``<rate>_wilson_low`` and ``<rate>_wilson_high``.
+
+    Args:
+        lf: Frame with the additive measures described in the module docstring, a
+            ``payment_method`` column and the ``dims`` columns.
+        dims: Columns to group by; may be empty for a grand total.
+
+    Returns:
+        ``dims`` followed by ``attempts``, ``declined``, ``decline_rate``, ``failed``,
+        ``failure_rate``, ``voucher_attempts``, ``expired``, ``expiration_rate`` and the Wilson
+        bounds of the three rates, sorted by ``dims``.
+    """
+    is_voucher = pl.col("payment_method").is_in(VOUCHER_METHODS)
+    paid = pl.col("n_approved") + pl.col("n_refunded")
+    sums = [
+        (paid + pl.col("n_declined") + pl.col("n_failed")).sum().alias("attempts"),
+        pl.col("n_declined").sum().alias("declined"),
+        pl.col("n_failed").sum().alias("failed"),
+        (paid + pl.col("n_expired")).filter(is_voucher).sum().alias("voucher_attempts"),
+        pl.col("n_expired").filter(is_voucher).sum().alias("expired"),
+    ]
+    aggregated = lf.group_by(dims).agg(sums).sort(dims) if dims else lf.select(sums)
+
+    columns: list[pl.Expr] = []
+    for successes, n, name in (
+        ("declined", "attempts", "decline_rate"),
+        ("failed", "attempts", "failure_rate"),
+        ("expired", "voucher_attempts", "expiration_rate"),
+    ):
+        low, high = wilson_interval_expr(pl.col(successes), pl.col(n))
+        columns += [
+            rate_expr(pl.col(successes), pl.col(n)).alias(name),
+            low.alias(f"{name}_wilson_low"),
+            high.alias(f"{name}_wilson_high"),
+        ]
+    return aggregated.with_columns(columns).select(
+        *dims,
+        "attempts",
+        "declined",
+        pl.col("^decline_rate.*$"),
+        "failed",
+        pl.col("^failure_rate.*$"),
+        "voucher_attempts",
+        "expired",
+        pl.col("^expiration_rate.*$"),
     )

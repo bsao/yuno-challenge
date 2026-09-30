@@ -257,3 +257,71 @@ that uses neither the marts nor `performance`:
 
 The Wilson bounds agree to four decimals on every segment (expression path against the scalar
 reference), and the OXXO completion rate is 59.9731% on both paths.
+
+## Step 5: failure analysis and anomaly detection
+
+Proposed commit: `feat(analytics): add failure analysis and anomaly detection`
+
+**Delivered**
+
+- `analytics/anomalies.py`: five descriptive views and three detectors.
+- `analytics/metrics.py`: `outcome_rates(lf, dims)` with `decline_rate`, `failure_rate` and
+  `expiration_rate`; `performance` also returns `voucher_paid`.
+- Tests: 12 for the anomalies module (hand computed z scores and peer comparisons, plus the planted
+  anomaly test on a full scale pipeline run) and 1 more for the metrics (62 in total).
+
+**Decisions**: D10.
+
+**Coverage against the step specification**
+
+| Requirement | Status | Evidence |
+| --- | --- | --- |
+| Decline and failure reasons by volume and share per country and method | Met | `reason_breakdown` |
+| Hour x weekday decline heatmap data | Met | `decline_heatmap`, 168 rows (7 x 24), optional split by extra dimensions |
+| Decline rate by USD amount bucket | Met | `decline_rate_by_amount_bucket` |
+| OXXO expiration by amount bucket and by merchant | Met | `oxxo_expiration_by_amount_bucket`, `oxxo_expiration_by_merchant` |
+| Daily decline rate per psp x country x payment_method against a trailing 14 day baseline, flag when z >= 3 and attempts >= 50 | Met | `score_daily_decline_rate` |
+| Flag merchants whose authorization or completion rate is far below country and category peers | Met | `score_merchants_against_peers` |
+| Test that loads `planted_anomalies.json` and asserts every planted anomaly is detected | Met | `test_every_planted_anomaly_is_detected` |
+
+One addition beyond the listed detectors: `score_hourly_reason_rate`. Planted anomaly c (timeouts
+between 02:00 and 04:00 on one weekend) is invisible to the daily rule, so "every planted anomaly
+is detected" needs an hourly rule (D10).
+
+**Verification**: `make check` passes (62 tests, 11 seconds). The planted anomaly test runs the
+whole pipeline at full scale, so `make check` now needs about 2.4 GB of memory.
+
+Detection results on the full dataset:
+
+| Detector | Rows scored | Flags | Planted | Chance flags |
+| --- | --- | --- | --- | --- |
+| Daily decline rate | 1,112 | 3 | 3 days of anomaly a | 0 |
+| Hourly reason rate | 52,822 | 4 | 4 hour slots of anomaly c | 0 |
+| Merchant against peers | 182 | 1 | the merchant of anomaly b | 0 |
+
+Double check, each detector against a recomputation from staging in plain Python (no marts, no
+metrics module, no detector code):
+
+| Flag | Detector | Staging recompute |
+| --- | --- | --- |
+| a) 2026-09-01 | 268 attempts, rate 0.3955, baseline 0.2006, z 7.9681 | 268, 0.3955, 0.2006, 7.9681 |
+| a) 2026-09-02 | 285 attempts, rate 0.3825, baseline 0.2145, z 6.9094 | 285, 0.3825, 0.2145, 6.9094 |
+| a) 2026-09-03 | 286 attempts, rate 0.3706, baseline 0.2297, z 5.6662 | 286, 0.3706, 0.2297, 5.6662 |
+| c) 2026-09-12 02h | 33 attempts, 27 timeouts, baseline 0.01167, z 43.139 | 33, 27, 0.01167, 43.139 |
+| c) 2026-09-12 03h | 28 attempts, 20 timeouts, baseline 0.01167, z 34.618 | 28, 20, 0.01167, 34.618 |
+| c) 2026-09-13 02h | 23 attempts, 13 timeouts, baseline 0.01260, z 23.765 | 23, 13, 0.01260, 23.765 |
+| c) 2026-09-13 03h | 28 attempts, 18 timeouts, baseline 0.01260, z 29.905 | 28, 18, 0.01260, 29.905 |
+| b) mrc_037 completion | 4,730 vouchers, rate 0.0404, 7,453 peer vouchers, peer rate 0.6354 | 4,730, 0.0404, 7,453, 0.6354 |
+
+**Findings from the descriptive views**
+
+- Reasons: `insufficient_funds` leads everywhere (39% of Mexican card failures), then
+  `card_declined` (31%) and `fraud_suspected` (18%); technical failures are about 12%.
+- Ticket size: the decline rate is flat, 17.1% for tickets under 10 USD to 18.2% above 250 USD.
+  OXXO expiration is also flat across ticket sizes (39% to 41%). Ticket size is not a driver in
+  this dataset, and the generator plants no such effect.
+- Heatmap: the decline rate varies only between 15.5% and 19.5% across the 168 weekday and hour
+  cells. The highest failure rates are Saturday 03:00 (5.8%) and Saturday and Sunday 02:00 (4.7%),
+  the footprint of anomaly c.
+- OXXO by merchant: `mrc_037` expires 96.0% of 4,730 vouchers; the next merchant is at 51.6% on
+  only 62 vouchers.

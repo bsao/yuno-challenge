@@ -142,7 +142,7 @@ All formulas live in `analytics/metrics.py`; `performance(lf, dims)` returns the
 of dimensions, computed as Polars expressions over the additive measures.
 
 | Metric | Formula |
-|---|---|
+| --- | --- |
 | `approved` | `n_approved + n_refunded` (a refunded transaction was authorized first) |
 | `attempts` | `approved + n_declined + n_failed` (pending and expired are excluded) |
 | `auth_rate` | `approved / attempts` |
@@ -162,3 +162,45 @@ of dimensions, computed as Polars expressions over the additive measures.
   OXXO the best method in Mexico; the completion rate is the number that matters for it.
 - **Like for like PSP comparison**: PSP_C and PSP_D are live in Colombia for only the last 45 days,
   so the PSP comparison uses only the days on which every PSP of the segment was live.
+
+## D10. Failure analysis and anomaly detection
+
+`analytics/anomalies.py` chooses grains and rules; every rate still comes from
+`analytics/metrics.py`, which gained three definitions:
+
+| Metric | Formula |
+| --- | --- |
+| `decline_rate` | `n_declined / attempts` (issuer or risk refusal) |
+| `failure_rate` | `n_failed / attempts` (technical error) |
+| `expiration_rate` | `expired / (paid + expired)`, voucher methods only; the complement of `completion_rate` |
+
+**Descriptive views**: reasons by volume and share per country and method (share of the declined
+and failed transactions of that country and method); decline and failure rate per local weekday and
+hour; per USD ticket bucket (0-10, 10-25, 25-50, 50-100, 100-250, 250+, left closed); OXXO
+expiration per ticket bucket and per merchant.
+
+**Detection rules**
+
+| Detector | Grain | Baseline | Flag when |
+| --- | --- | --- | --- |
+| Daily decline rate | date x psp x country x payment_method | pooled rate of the previous 14 days of the segment | `z >= 3` and `attempts >= 50` |
+| Hourly reason rate | psp x country x local date x local hour x reason | pooled rate of the previous 14 days (all hours) | `z >= 5`, `attempts >= 20` and `events >= 10` |
+| Merchant against peers | merchant x metric (authorization, completion) | other merchants of the same country and category | `attempts >= 50` and Wilson upper bound more than 10 points below the peer rate |
+
+`z = (rate - baseline_rate) / sqrt(baseline_rate * (1 - baseline_rate) / attempts)`.
+
+- **Why a second, hourly detector**: a two hour outage moves the daily rate of its segment by only
+  a few points, so the daily rule cannot see it. The hourly rule looks at one reason in one hour.
+- **Why z >= 5 for the hourly rule**: it scores about 53,000 slot and reason combinations. At
+  z >= 3 it raised 63 flags, 59 of them chance (all between 3.0 and 4.6). At z >= 5 the expected
+  number of chance flags is below one, and only the planted window remains. The daily rule scores
+  1,112 rows, where z >= 3 produced no chance flag.
+- **Pooled baseline, not a mean of daily rates**: pooling weights each day by its volume, so a low
+  volume day cannot distort the baseline. A segment is scored only after 14 days of history.
+- **Baselines include earlier anomalous days.** During a multi day incident the z score decays
+  (7.97, 6.91, 5.67 over the three planted days). That is conservative; excluding flagged days
+  from the baseline is the production refinement.
+- **Peers leave the merchant out**, so a large merchant is not compared with itself. A merchant
+  alone in its country and category falls back to country peers, and `peer_scope` records which
+  was used.
+- **Limitation**: the merchant authorization rate is not adjusted for payment method mix.

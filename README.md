@@ -10,7 +10,7 @@ merchant conversion drops are UX or processing issues, and which failure pattern
 docker compose up --build
 ```
 
-Then open http://localhost:8501. The `pipeline` service builds the data and exits; the `app`
+Then open <http://localhost:8501>. The `pipeline` service builds the data and exits; the `app`
 service starts the dashboard once the pipeline has completed successfully.
 
 ## Develop locally
@@ -22,7 +22,7 @@ make check
 ```
 
 | Target | What it does |
-|---|---|
+| --- | --- |
 | `make install` | Install runtime and development dependencies |
 | `make data` | Generate the synthetic raw webhooks |
 | `make pipeline` | Run generate (if needed), ingest, transform and quality checks |
@@ -44,4 +44,4 @@ make check
 
 ## Status
 
-The pipeline runs end to end (`make pipeline` generates, ingests, builds the marts and logs the headline findings); the dashboard views and the anomaly, health and cost analyses are stubs.
+The pipeline runs end to end (`make pipeline` generates, ingests, builds the marts and logs the headline findings); failure analysis and anomaly detection are in `analytics/anomalies.py`. The dashboard views and the health and cost analyses are stubs.
