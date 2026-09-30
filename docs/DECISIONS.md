@@ -1,6 +1,6 @@
 # Decisions
 
-Design decisions and their trade offs. Metric definitions are in D6 and D7.
+Design decisions and their trade offs. Metric definitions are in D6, D7, D9 and D10.
 
 ## D1. Stack and tooling
 
@@ -141,3 +141,45 @@ measures.
 - **Gaps**: the hour by weekday heatmap and the OXXO by merchant chart show the sample size but no
   interval. USD is shown in every view, including single country ones, because the aggregate
   stores USD only.
+
+## D9. Merchant health score
+
+`analytics/health.py` scores each merchant from 0 to 100; below 50 is `at_risk`. The score is a
+weighted sum of four components, each mapped linearly from a bad anchor (0) to a good anchor (100)
+and clipped.
+
+| Component | Weight | Input | Bad (0) | Good (100) |
+| --- | --- | --- | --- | --- |
+| Authorization | 40% | `auth_rate` minus the rate of country and category peers | -10 points | +5 points |
+| Failure | 20% | `failure_rate` (technical failures / attempts) | 10% | 0% |
+| Refund | 15% | `refund_rate = n_refunded / approved` | 10% | 0% |
+| Volume | 25% | transactions last 30 days / previous 30 days - 1 | -50% | +25% |
+
+- **Why these weights**: authorization is what the merchant loses sales on, so it weighs most; a
+  volume drop is the strongest sign a merchant is leaving; failures and refunds are secondary.
+- **Main driver** is the component costing the most points, `weight * (100 - component score)`,
+  so the list says what to talk about, not only whom to call.
+- **An undefined input scores a neutral 50**, so a new merchant is neither rewarded nor punished.
+- **Calibration**: an average merchant (at its peers, 3% failures, 2% refunds, flat volume) scores
+  69. A merchant must be clearly worse on the heavy components to fall below 50.
+- **Limitations**: the voucher completion rate is not a component, so the merchant with the broken
+  OXXO flow scores healthy here and is caught by the peer detector (D7) instead. Authorization is
+  not adjusted for method mix. Small merchants have noisy components.
+
+## D10. PSP cost
+
+`analytics/cost.py`, per psp x country x payment_method, from `psp_fees.csv`.
+
+- **Fee model (assumption)**: the percentage fee is charged on successful volume and is not
+  returned on a refund; the fixed fee is charged on every attempt. So
+  `total_fees = pct_fee / 100 * gmv_usd + fixed_fee_usd * attempts` and
+  `cost_per_success = total_fees / approved`. A PSP that fails more pays its fixed fee more often
+  per sale.
+- **Simulation**: move 20% of the worst PSP's attempts to the best PSP of the segment, holding
+  observed authorization rates; moved traffic keeps the average ticket of the PSP it leaves;
+  results are scaled to 30 days. `monthly_savings = fees_before - fees_after` on the moved traffic.
+- **Like for like**: only the days on which every PSP of the segment was live.
+- **Savings are fees only, and the approved GMV delta is always reported next to them.** Ranked by
+  cost, the cheapest PSP per sale is usually the one that approves less, so saving fees loses
+  sales. The simulation can also rank by authorization rate, which shows the opposite trade.
+- **Limitation**: no margin is assumed, so fees and GMV are not netted into one number.

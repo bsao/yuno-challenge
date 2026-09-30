@@ -42,19 +42,28 @@ Like for like, from 2026-08-17 when PSP_C and PSP_D went live:
   (finding 4), so grow it with monitoring.
 - **Do not keep PSP_D on authorization grounds.** It is the worst PSP on both methods, 7 points
   below PSP_A on cards. It is the cheapest, but a lost sale costs far more than a fee point.
-- **Open**: the fee trade off is not quantified. `analytics/cost.py` is not implemented, so the
-  recommendation rests on authorization rate alone.
+- **Cost confirms it.** Per successful card transaction PSP_D costs $0.99 and PSP_C $1.43 (fee on
+  successful volume plus the fixed fee on every attempt). Moving 20% of PSP_C's Colombian traffic
+  to PSP_D would save about $1,142 a month in fees and lose about $11,976 a month in approved GMV.
+  A cheaper fee does not pay for an 11 point lower authorization rate.
 
 ## 3. Are merchant conversion drops UX or processing issues
 
-**Not answered yet.** `analytics/health.py` is not implemented, and the generator plants no
-conversion drop over time. What exists today:
+**The tooling exists; this dataset contains no such drop.** The health score (authorization
+against peers 40%, technical failures 20%, refunds 15%, 30 day volume trend 25%) labels all 120
+merchants healthy: scores run from 60 to 84, median 69. The main driver separates the two causes: a
+processing problem shows as `authorization` or `failure`, a demand or checkout problem as `volume`.
+Here 109 merchants are driven by authorization, 10 by volume and 1 by failure, none severely. The
+generator plants no conversion drop over time, so there is nothing more to find.
+
+One experience problem is found by the peer detector rather than the score:
 
 - One merchant is flagged against its country and category peers: `mrc_037` completes 4.0% of
   4,730 OXXO vouchers while its peers complete 63.5%. Its customers receive a voucher and do not
   pay, with no PSP refusal involved. That is a checkout or post checkout experience problem, not a
   processing one.
 - No merchant is flagged on authorization rate.
+- Gap: the health score has no completion component, so it rates `mrc_037` healthy (67).
 
 ## 4. What failure patterns exist
 
@@ -72,3 +81,17 @@ conversion drop over time. What exists today:
 - **Voucher flow broken at `mrc_037`** (finding 3).
 
 All three planted anomalies are detected, with no other flag raised.
+
+## 5. What would rerouting save
+
+Moving 20% of the worst PSP's traffic to the best PSP in each of the 7 segments, at observed
+authorization rates, scaled to a month:
+
+| Worst and best defined by | Fee savings / month | Approved transactions / month | Approved GMV / month |
+| --- | --- | --- | --- |
+| Cost per successful transaction | +$4,171 | -509 | -$26,292 |
+| Authorization rate | -$3,314 | +1,422 | +$57,932 |
+
+Chasing the cheapest PSP saves fees and loses more than six times as much in sales. Routing by
+authorization rate costs $3,314 in fees to gain $57,932 in approved GMV. Only in Chile is the same
+PSP (PSP_B) both cheaper and better. Route on authorization rate first, and use cost to negotiate.

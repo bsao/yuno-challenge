@@ -1,13 +1,16 @@
 """Streamlit dashboard for TiendaMax payment analytics.
 
-Purpose: present payment performance, failure patterns and anomalies to the TiendaMax data team.
+Purpose: present payment performance, failure patterns, anomalies, merchant health and PSP cost
+    to the TiendaMax data team.
 Inputs: ``fct_transactions.parquet`` and ``agg_daily.parquet`` under ``$DATA_DIR/marts`` (default
-    ``data/marts``), produced by ``pipeline.run``. ``PYTHONPATH`` must include the repository root.
+    ``data/marts``) and ``$DATA_DIR/raw/psp_fees.csv``, produced by ``pipeline.run``.
+    ``PYTHONPATH`` must include the repository root.
 Outputs: an interactive web page served on port 8501.
 
 Design:
     * The page holds no metric logic. Every number comes from ``analytics.metrics`` or
-      ``analytics.anomalies``; the functions here only filter, cache and draw.
+      ``analytics.anomalies``, ``analytics.health`` or ``analytics.cost``; the functions here only
+      filter, cache and draw.
     * Each cached function scans the Parquet marts lazily and returns a small aggregated frame,
       keyed by the sidebar filters, so the 1.2 million row fact table is never held in the session.
     * Every rate is shown with its sample size and Wilson 95% interval, and every chart carries a
@@ -25,7 +28,8 @@ import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
-from analytics import anomalies
+from analytics import anomalies, cost
+from analytics.health import COMPONENTS, merchant_health
 from analytics.metrics import performance
 from pipeline.transform import AGG_DAILY_FILE, FCT_FILE, aggregate_additive_measures
 
@@ -33,6 +37,7 @@ PAGE_TITLE = "TiendaMax Payment Intelligence"
 MARTS_DIR = Path(os.environ.get("DATA_DIR", "data")) / "marts"
 FCT_PATH = MARTS_DIR / FCT_FILE
 AGG_DAILY_PATH = MARTS_DIR / AGG_DAILY_FILE
+FEES_PATH = MARTS_DIR.parent / "raw" / "psp_fees.csv"
 
 MIN_MERCHANT_ATTEMPTS = 200
 MERCHANT_ROWS = 10
@@ -123,6 +128,27 @@ def load_anomalies(countries: tuple[str, ...]) -> dict[str, pl.DataFrame]:
         "merchant": (
             anomalies.score_merchants_against_peers(fct).filter(pl.col("is_anomaly")).collect()
         ),
+    }
+
+
+@st.cache_data
+def load_merchant_health(end: date, countries: tuple[str, ...]) -> pl.DataFrame:
+    """Score merchants on all history up to ``end`` for the selected countries."""
+    fct = pl.scan_parquet(FCT_PATH).filter(
+        (pl.col("local_date") <= end) & pl.col("country").is_in(list(countries))
+    )
+    return merchant_health(fct).collect()
+
+
+@st.cache_data
+def load_costs(filters: Filters, rank_by: cost.RankBy) -> dict[str, pl.DataFrame]:
+    """Return the like for like cost per success and the traffic shift simulation."""
+    agg_daily, fees = _agg_daily(*filters), pl.scan_csv(FEES_PATH)
+    return {
+        "costs": cost.cost_per_successful_transaction(
+            cost.like_for_like(agg_daily), fees
+        ).collect(),
+        "shift": cost.simulate_traffic_shift(agg_daily, fees, rank_by=rank_by).collect(),
     }
 
 
@@ -650,12 +676,155 @@ def render_anomalies(filters: Filters) -> None:
     )
 
 
+def render_health(filters: Filters) -> None:
+    """Render the ranked merchant health list with the main driver of each score."""
+    _, end, countries = filters
+    health = load_merchant_health(end, countries)
+    at_risk = health.filter(pl.col("label") == "at_risk").height
+    tiles = st.columns(3)
+    tiles[0].metric("Merchants scored", f"{health.height:,}")
+    tiles[1].metric("At risk (score below 50)", f"{at_risk:,}")
+    tiles[2].metric("Median score", f"{health.get_column('health_score').median():.0f}")
+    weights = ", ".join(f"{name} {weight:.0%}" for name, (weight, *_rest) in COMPONENTS.items())
+    st.dataframe(
+        health.select(
+            pl.col("merchant_id").alias("Merchant"),
+            pl.col("country").alias("Country"),
+            pl.col("merchant_category").alias("Category"),
+            pl.col("health_score").round(1).alias("Score"),
+            pl.col("label").alias("Label"),
+            pl.col("main_driver").alias("Main driver"),
+            pl.col("attempts").alias("Attempts"),
+            (pl.col("auth_gap") * 100).round(1).alias("Auth vs peers (pts)"),
+            (pl.col("failure_rate") * 100).round(1).alias("Failure rate %"),
+            (pl.col("refund_rate") * 100).round(1).alias("Refund rate %"),
+            (pl.col("volume_trend") * 100).round(0).alias("30 day volume %"),
+        ),
+        hide_index=True,
+        column_config={
+            "Score": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f")
+        },
+    )
+    st.caption(
+        f"Decision: which merchants an account manager calls first, and about what. Ranked "
+        f"worst first. Score = weighted sum of four components ({weights}); the main driver is "
+        f"the component costing the most points. Rates use all history up to the end date; "
+        f"volume compares the last 30 days with the 30 before. Read scores of merchants with few "
+        f"attempts with caution."
+    )
+
+
+def render_cost(filters: Filters) -> None:
+    """Render the cost per successful transaction and the traffic shift simulation."""
+    rank_by = st.radio(
+        "Define the worst and best PSP by",
+        ["cost_per_success_usd", "auth_rate"],
+        format_func={
+            "cost_per_success_usd": "Cost per successful transaction",
+            "auth_rate": "Authorization rate",
+        }.get,
+        horizontal=True,
+    )
+    views = load_costs(filters, rank_by)
+    costs = views["costs"].filter(pl.col("cost_per_success_usd").is_not_null())
+    shift = views["shift"]
+
+    chart = go.Figure()
+    for psp, color in PSP_COLORS.items():
+        rows = costs.filter(pl.col("psp") == psp)
+        if rows.height == 0:
+            continue
+        chart.add_trace(
+            go.Scatter(
+                x=rows.get_column("cost_per_success_usd").to_list(),
+                y=[
+                    f"{COUNTRY_NAMES.get(c, c)} · {m}"
+                    for c, m in rows.select("country", "payment_method").rows()
+                ],
+                customdata=rows.select(
+                    "auth_rate", "attempts", "pct_fee", "fixed_fee_usd", "avg_ticket_usd"
+                ).rows(),
+                mode="markers",
+                marker={"color": color, "size": 12, "line": {"color": SURFACE, "width": 2}},
+                name=psp,
+                hovertemplate=(
+                    "%{y} · " + psp + "<br>Cost per success $%{x:.3f}<br>"
+                    "Fee %{customdata[2]:.1f}% + $%{customdata[3]:.2f} per attempt<br>"
+                    "Authorization rate %{customdata[0]:.1%}, n = %{customdata[1]:,}<br>"
+                    "Average ticket $%{customdata[4]:.2f}<extra></extra>"
+                ),
+            )
+        )
+    chart.update_layout(title="Cost per successful transaction (USD), like for like days")
+    chart.update_xaxes(tickprefix="$", rangemode="tozero")
+    chart.update_yaxes(autorange="reversed")
+    _show(
+        _style(chart, height=150 + 40 * costs.select("country", "payment_method").n_unique()),
+        "negotiate fees or reroute where a PSP is expensive per sale. Cost = percentage fee on "
+        "successful volume plus the fixed fee on every attempt, divided by successes.",
+    )
+    with st.expander("Cost per successful transaction as a table"):
+        st.dataframe(
+            costs.select(
+                "country",
+                "payment_method",
+                "psp",
+                "attempts",
+                pl.col("auth_rate").map_elements(_pct, return_dtype=pl.String),
+                "pct_fee",
+                "fixed_fee_usd",
+                pl.col("avg_ticket_usd").round(2),
+                pl.col("total_fees_usd").round(0),
+                pl.col("cost_per_success_usd").round(3),
+            ),
+            hide_index=True,
+        )
+
+    st.subheader("Simulation: move 20% of the worst PSP's traffic to the best PSP")
+    if shift.height == 0:
+        st.info("No segment has two PSPs in the current filters.")
+        return
+    tiles = st.columns(3)
+    tiles[0].metric("Monthly fee savings", f"${shift.get_column('monthly_savings_usd').sum():,.0f}")
+    tiles[1].metric(
+        "Monthly approved transactions", f"{shift.get_column('monthly_approved_delta').sum():+,.0f}"
+    )
+    gmv_delta = shift.get_column("monthly_gmv_delta_usd").sum()
+    tiles[2].metric(
+        "Monthly approved GMV", f"{'-' if gmv_delta < 0 else '+'}${abs(gmv_delta):,.0f}"
+    )
+    st.dataframe(
+        shift.select(
+            pl.col("country").alias("Country"),
+            pl.col("payment_method").alias("Method"),
+            pl.col("days").alias("Days compared"),
+            pl.col("worst_psp").alias("From"),
+            pl.col("best_psp").alias("To"),
+            pl.col("worst_auth_rate").map_elements(_pct, return_dtype=pl.String).alias("From auth"),
+            pl.col("best_auth_rate").map_elements(_pct, return_dtype=pl.String).alias("To auth"),
+            pl.col("worst_cost_per_success_usd").round(3).alias("From cost"),
+            pl.col("best_cost_per_success_usd").round(3).alias("To cost"),
+            pl.col("moved_attempts_monthly").round(0).alias("Attempts moved / month"),
+            pl.col("monthly_savings_usd").round(0).alias("Fee savings / month"),
+            pl.col("monthly_approved_delta").round(0).alias("Approved / month"),
+            pl.col("monthly_gmv_delta_usd").round(0).alias("GMV / month"),
+        ),
+        hide_index=True,
+    )
+    st.caption(
+        "Decision: where to reroute traffic. Observed authorization rates are held, moved traffic "
+        "keeps the ticket of the PSP it leaves, and results are scaled to 30 days. Savings are "
+        "fees only: the cheapest PSP per sale is often the one that approves less, so read the "
+        "fee savings together with the approved GMV it gains or loses."
+    )
+
+
 def main() -> None:
     """Render the page: sidebar filters and one tab per view."""
     st.set_page_config(page_title=PAGE_TITLE, layout="wide")
     st.title(PAGE_TITLE)
-    if not (FCT_PATH.exists() and AGG_DAILY_PATH.exists()):
-        st.error(f"Marts not found under {MARTS_DIR}. Run `make pipeline` first.")
+    if not (FCT_PATH.exists() and AGG_DAILY_PATH.exists() and FEES_PATH.exists()):
+        st.error(f"Data not found under {MARTS_DIR.parent}. Run `make pipeline` first.")
         st.stop()
 
     first, last, available = load_filter_bounds()
@@ -674,7 +843,7 @@ def main() -> None:
         st.stop()
     filters: Filters = (picked[0], picked[1], tuple(sorted(countries)))
 
-    overview, perf, failures, flagged, health, cost = st.tabs(
+    overview, perf, failures, flagged, health, cost_tab = st.tabs(
         ["Overview", "Performance", "Failures", "Anomalies", "Merchant Health", "Cost"]
     )
     with overview:
@@ -686,11 +855,9 @@ def main() -> None:
     with flagged:
         render_anomalies(filters)
     with health:
-        st.info(
-            "Placeholder: merchant health (UX versus processing issues) arrives in a later step."
-        )
-    with cost:
-        st.info("Placeholder: PSP cost analysis arrives in a later step.")
+        render_health(filters)
+    with cost_tab:
+        render_cost(filters)
 
 
 main()

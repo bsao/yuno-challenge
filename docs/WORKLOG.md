@@ -23,6 +23,8 @@ in [ANALYSIS.md](ANALYSIS.md).
 | 5 | Failure analysis | Five descriptive views, three anomaly detectors, planted anomaly test | D6, D7 |
 | 6 | Dashboard | Filters and four working tabs, rebuilt and verified in Docker | D8 |
 | 7 | Validation | Full cycle from a fresh clone, documentation review | below |
+| 8 | Merchant health | 0 to 100 score with documented weights, label, main driver; Merchant Health tab | D9 |
+| 9 | PSP cost | Cost per successful transaction, 20% traffic shift simulation; Cost tab | D10 |
 
 A first generator, built before the specification of step 2 arrived, was replaced by it.
 
@@ -46,13 +48,19 @@ Each number was computed twice, through code paths that share nothing.
 | 5 | `mrc_037` completion and peer rate | 4.04% and 63.54% | 4.04% and 63.54% | same |
 | 6 | Dashboard attempts and authorization rate (container) | 1,145,522 and 79.3% | 1,145,522 and 79.3% | eager recomputation from local staging |
 | 6 | Dashboard GMV and net GMV (container) | $38,143,368 and $37,425,324 | same | same |
+| 8 | Health score of the lowest merchant, `mrc_017` | 60.0084 | 60.0084 | plain Python from staging and `merchants.csv` |
+| 9 | Cost per success, PSP_C and PSP_D, Colombia cards | $1.4290 and $0.9866 | $1.4290 and $0.9866 | plain Python from staging and `psp_fees.csv` |
+| 9 | Mexico cards shift: fee savings and GMV delta per month | $2,032.86 and -$23,113.55 | same | same |
+| 9 | Cost tab totals (container) | $4,171, -509, -$26,292 | $4,171.31, -509, -$26,291.62 | local run of the module |
 
 Detection result: 3 daily flags, 4 hourly flags and 1 merchant flag, exactly the three planted
 anomalies, with no other flag.
 
 ## Step 7: validation from a fresh clone
 
-Every command was run in a new clone with a new virtual environment.
+Every command was run in a new clone with a new virtual environment, before steps 8 and 9. After
+them, `make check` passes with 76 tests and the rebuilt Docker stack serves all six tabs without
+error.
 
 | Command | Result |
 | --- | --- |
@@ -76,8 +84,9 @@ the standalone `docker-compose` binary (`make up COMPOSE=docker-compose`), the s
 
 | Item | Status |
 | --- | --- |
-| `analytics/health.py`: are merchant conversion drops UX or processing | Not implemented; dashboard tab is a placeholder |
-| `analytics/cost.py`: PSP cost against authorization gain | Not implemented; `psp_fees.csv` is generated but unused |
+| Merchant conversion drops over time | The dataset plants none, so the health score labels every merchant healthy |
+| Voucher completion in the health score | Not a component; the broken OXXO merchant is caught only by the peer detector |
+| Cost simulation | Fees and approved GMV are reported side by side; no margin is assumed to net them |
 | Wilson interval on every rate | Missing on the hour by weekday heatmap and the OXXO by merchant chart |
 | Memory | Pipeline and `make check` need about 2.4 GB at the default scale |
 | Commit history | Two commit subjects (`7a6e285`, `d49b884`) do not follow Conventional Commits |

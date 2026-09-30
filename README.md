@@ -36,7 +36,7 @@ make check
 
 - `data_gen/`: synthetic webhook generator
 - `pipeline/`: `ingest` (raw to staging), `transform` (staging to marts), `quality`, `run`
-- `analytics/`: `metrics` (all definitions), `anomalies`; `health` and `cost` are not implemented
+- `analytics/`: `metrics` (definitions), `anomalies`, `health` (merchant score), `cost` (PSP cost)
 - `app/`: Streamlit dashboard
 - `data/`: generated at run time, not versioned (`raw/`, `staging/`, `marts/`)
 
@@ -48,9 +48,8 @@ make check
 
 ## Status
 
-Working: generation, ingestion, marts, metrics, failure analysis, anomaly detection, and the
-Overview, Performance, Failures and Anomalies tabs. Not implemented: merchant health (UX versus
-processing) and PSP cost; their tabs are placeholders.
+Every module and all six dashboard tabs work. Known gaps are listed under "Open items" in the
+worklog.
 
 ## Screenshots
 
@@ -58,3 +57,5 @@ processing) and PSP cost; their tabs are placeholders.
 ![Performance](docs/screenshots/02_performance.png)
 ![Failures](docs/screenshots/03_failures.png)
 ![Anomalies](docs/screenshots/04_anomalies.png)
+![Merchant Health](docs/screenshots/05_merchant_health.png)
+![Cost](docs/screenshots/06_cost.png)
