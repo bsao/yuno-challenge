@@ -34,16 +34,10 @@ def _transactions(groups: list[dict[str, Any]]) -> pl.LazyFrame:
         "n": 1,
     }
     rows = [{**defaults, **group} for group in groups for _ in range(group.get("n", 1))]
-    return (
-        pl.DataFrame(rows, schema_overrides={"decline_reason": pl.String})
-        .drop("n")
-        .lazy()
-    )
+    return pl.DataFrame(rows, schema_overrides={"decline_reason": pl.String}).drop("n").lazy()
 
 
-def _agg_day(
-    day: int, attempts: int, declined: int, psp: str = "PSP_A"
-) -> dict[str, Any]:
+def _agg_day(day: int, attempts: int, declined: int, psp: str = "PSP_A") -> dict[str, Any]:
     """Build one ``agg_daily`` row with the given attempts and declines."""
     return {
         "date": START + timedelta(days=day),
@@ -61,9 +55,7 @@ def _agg_day(
 def test_daily_decline_rate_is_scored_against_the_trailing_14_days() -> None:
     """Baseline 20%: 40 of 100 gives z = 5.0 (flagged); 26 of 100 gives z = 1.5 (not flagged)."""
     rows = [_agg_day(day, 100, 20) for day in range(14)]
-    rows.append(
-        _agg_day(14, 100, 40)
-    )  # z = (0.40 - 0.20) / sqrt(0.2 * 0.8 / 100) = 5.0
+    rows.append(_agg_day(14, 100, 40))  # z = (0.40 - 0.20) / sqrt(0.2 * 0.8 / 100) = 5.0
     rows.append(_agg_day(15, 100, 26))  # baseline 300 / 1400; not an anomaly
 
     scored = anomalies.score_daily_decline_rate(pl.DataFrame(rows).lazy()).collect()
@@ -75,9 +67,7 @@ def test_daily_decline_rate_is_scored_against_the_trailing_14_days() -> None:
     assert spike["z"] == pytest.approx(5.0)
     assert spike["is_anomaly"] is True
     after = scored.row(15, named=True)
-    assert after["baseline_rate"] == pytest.approx(
-        300 / 1400
-    )  # the spike day is in the window
+    assert after["baseline_rate"] == pytest.approx(300 / 1400)  # the spike day is in the window
     assert after["z"] == pytest.approx(
         (0.26 - 300 / 1400) / (300 / 1400 * 1100 / 1400 / 100) ** 0.5
     )
@@ -91,9 +81,7 @@ def test_daily_decline_rate_needs_at_least_50_attempts() -> None:
     rows.append(_agg_day(14, 40, 16))  # z = 0.20 / sqrt(0.16 / 40) = 3.162
 
     last = (
-        anomalies.score_daily_decline_rate(pl.DataFrame(rows).lazy())
-        .collect()
-        .row(-1, named=True)
+        anomalies.score_daily_decline_rate(pl.DataFrame(rows).lazy()).collect().row(-1, named=True)
     )
 
     assert last["z"] == pytest.approx(3.1623, abs=1e-4)
@@ -128,12 +116,8 @@ def test_merchant_far_below_peers_is_flagged() -> None:
     scored = anomalies.score_merchants_against_peers(fct).collect()
     rows = {row["merchant_id"]: row for row in scored.iter_rows(named=True)}
 
-    assert scored.get_column("metric").unique().to_list() == [
-        "auth_rate"
-    ]  # no vouchers here
-    assert rows["mrc_low"]["peer_rate"] == pytest.approx(
-        180 / 200
-    )  # the merchant is left out
+    assert scored.get_column("metric").unique().to_list() == ["auth_rate"]  # no vouchers here
+    assert rows["mrc_low"]["peer_rate"] == pytest.approx(180 / 200)  # the merchant is left out
     assert rows["mrc_low"]["wilson_high"] == pytest.approx(0.596170, abs=1e-5)
     assert rows["mrc_low"]["gap"] == pytest.approx(0.40)
     assert rows["mrc_low"]["is_anomaly"] is True
@@ -269,9 +253,7 @@ def test_oxxo_expiration_by_merchant_uses_resolved_vouchers_only() -> None:
 def test_hourly_reason_rate_is_scored_against_the_trailing_14_days() -> None:
     """Baseline 2%: 15 timeouts in 30 attempts is flagged; 9 in 100 has too few events."""
     groups: list[dict[str, Any]] = []
-    for day in range(
-        14
-    ):  # 14 baseline days: 100 attempts and 2 timeouts each, at 10:00
+    for day in range(14):  # 14 baseline days: 100 attempts and 2 timeouts each, at 10:00
         slot = {
             "psp": "PSP_A",
             "local_date": START + timedelta(days=day),
@@ -296,9 +278,7 @@ def test_hourly_reason_rate_is_scored_against_the_trailing_14_days() -> None:
     ]
 
     scored = anomalies.score_hourly_reason_rate(_transactions(groups)).collect()
-    last_day = scored.filter(pl.col("local_date") == today["local_date"]).sort(
-        "local_hour"
-    )
+    last_day = scored.filter(pl.col("local_date") == today["local_date"]).sort("local_hour")
     night, morning = last_day.row(0, named=True), last_day.row(1, named=True)
 
     assert night["baseline_rate"] == pytest.approx(28 / 1400)  # 0.02
@@ -321,9 +301,7 @@ def full_scale_data(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 def test_every_planted_anomaly_is_detected(full_scale_data: Path) -> None:
     """The detectors flag the three planted anomalies, and nothing else."""
-    planted = json.loads(
-        (full_scale_data / "raw" / "planted_anomalies.json").read_text()
-    )
+    planted = json.loads((full_scale_data / "raw" / "planted_anomalies.json").read_text())
     by_id = {anomaly["id"]: anomaly for anomaly in planted["anomalies"]}
     assert set(by_id) == {"a", "b", "c"}
     fct = pl.scan_parquet(full_scale_data / "marts" / "fct_transactions.parquet")
@@ -331,9 +309,7 @@ def test_every_planted_anomaly_is_detected(full_scale_data: Path) -> None:
 
     # a) Decline rate spike: every planted day of the planted segment is flagged.
     spike = by_id["a"]
-    first, last = date.fromisoformat(spike["start_date"]), date.fromisoformat(
-        spike["end_date"]
-    )
+    first, last = date.fromisoformat(spike["start_date"]), date.fromisoformat(spike["end_date"])
     expected_days = {
         (
             first + timedelta(days=offset),
@@ -344,29 +320,23 @@ def test_every_planted_anomaly_is_detected(full_scale_data: Path) -> None:
         for offset in range((last - first).days + 1)
     }
     daily_flags = (
-        anomalies.score_daily_decline_rate(agg_daily)
-        .filter(pl.col("is_anomaly"))
-        .collect()
+        anomalies.score_daily_decline_rate(agg_daily).filter(pl.col("is_anomaly")).collect()
     )
-    assert set(
-        daily_flags.select("date", "psp", "country", "payment_method").rows()
-    ) == (expected_days)
+    assert set(daily_flags.select("date", "psp", "country", "payment_method").rows()) == (
+        expected_days
+    )
 
     # b) Voucher expiration: the planted merchant is flagged on its completion rate.
     voucher = by_id["b"]
     merchant_flags = (
-        anomalies.score_merchants_against_peers(fct)
-        .filter(pl.col("is_anomaly"))
-        .collect()
+        anomalies.score_merchants_against_peers(fct).filter(pl.col("is_anomaly")).collect()
     )
     assert merchant_flags.select("merchant_id", "metric").rows() == [
         (voucher["merchant_id"], "completion_rate")
     ]
     worst = anomalies.oxxo_expiration_by_merchant(fct).collect().row(0, named=True)
     assert worst["merchant_id"] == voucher["merchant_id"]
-    assert worst["expiration_rate"] == pytest.approx(
-        voucher["expected_expiration_rate"], abs=0.03
-    )
+    assert worst["expiration_rate"] == pytest.approx(voucher["expected_expiration_rate"], abs=0.03)
 
     # c) Timeout spike: every planted date and hour is flagged for the planted PSP and reason.
     timeout = by_id["c"]
@@ -381,9 +351,7 @@ def test_every_planted_anomaly_is_detected(full_scale_data: Path) -> None:
         for day in timeout["dates"]
         for hour in timeout["local_hours"]
     }
-    hourly_flags = (
-        anomalies.score_hourly_reason_rate(fct).filter(pl.col("is_anomaly")).collect()
-    )
+    hourly_flags = anomalies.score_hourly_reason_rate(fct).filter(pl.col("is_anomaly")).collect()
     assert (
         set(
             hourly_flags.select(

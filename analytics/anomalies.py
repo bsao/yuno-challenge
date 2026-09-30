@@ -74,11 +74,7 @@ def _z_score(successes: pl.Expr, n: pl.Expr, baseline_rate: pl.Expr) -> pl.Expr:
     """
     defined = (n > 0) & (baseline_rate > 0) & (baseline_rate < 1)
     standard_error = (baseline_rate * (1 - baseline_rate) / n).sqrt()
-    return (
-        pl.when(defined)
-        .then((successes / n - baseline_rate) / standard_error)
-        .otherwise(None)
-    )
+    return pl.when(defined).then((successes / n - baseline_rate) / standard_error).otherwise(None)
 
 
 def _with_amount_bucket(fct: pl.LazyFrame) -> pl.LazyFrame:
@@ -88,9 +84,9 @@ def _with_amount_bucket(fct: pl.LazyFrame) -> pl.LazyFrame:
     )
     return fct.with_columns(
         order.alias("amount_bucket_order"),
-        order.replace_strict(
-            dict(enumerate(AMOUNT_BUCKET_LABELS)), return_dtype=pl.String
-        ).alias("amount_bucket"),
+        order.replace_strict(dict(enumerate(AMOUNT_BUCKET_LABELS)), return_dtype=pl.String).alias(
+            "amount_bucket"
+        ),
     )
 
 
@@ -122,9 +118,7 @@ def reason_breakdown(fct: pl.LazyFrame) -> pl.LazyFrame:
         .group_by(*group, "final_status", "decline_reason")
         .agg(pl.len().alias("transactions"))
         .with_columns(
-            (pl.col("transactions") / pl.col("transactions").sum().over(group)).alias(
-                "share"
-            )
+            (pl.col("transactions") / pl.col("transactions").sum().over(group)).alias("share")
         )
         .sort(
             [*group, "transactions", "decline_reason"],
@@ -148,9 +142,7 @@ def decline_heatmap(fct: pl.LazyFrame, dims: Sequence[str] = ()) -> pl.LazyFrame
     return _outcome_rates_by(fct, [*dims, "local_weekday", "local_hour"])
 
 
-def decline_rate_by_amount_bucket(
-    fct: pl.LazyFrame, dims: Sequence[str] = ()
-) -> pl.LazyFrame:
+def decline_rate_by_amount_bucket(fct: pl.LazyFrame, dims: Sequence[str] = ()) -> pl.LazyFrame:
     """Compute decline and failure rates per USD ticket size bucket.
 
     Grain: one row per ``dims`` x ``amount_bucket``. Buckets are left closed:
@@ -182,9 +174,7 @@ def oxxo_expiration_by_amount_bucket(fct: pl.LazyFrame) -> pl.LazyFrame:
         ``expiration_rate`` and its Wilson bounds, for buckets with resolved vouchers.
     """
     return (
-        _outcome_rates_by(
-            _with_amount_bucket(fct), ["amount_bucket_order", "amount_bucket"]
-        )
+        _outcome_rates_by(_with_amount_bucket(fct), ["amount_bucket_order", "amount_bucket"])
         .filter(pl.col("voucher_attempts") > 0)
         .select(
             "amount_bucket_order",
@@ -245,9 +235,7 @@ def score_daily_decline_rate(agg_daily: pl.LazyFrame) -> pl.LazyFrame:
             (trailing("declined") / trailing("attempts")).alias("baseline_rate"),
         )
         .with_columns(
-            _z_score(
-                pl.col("declined"), pl.col("attempts"), pl.col("baseline_rate")
-            ).alias("z")
+            _z_score(pl.col("declined"), pl.col("attempts"), pl.col("baseline_rate")).alias("z")
         )
         .with_columns(
             ((pl.col("z") >= Z_THRESHOLD) & (pl.col("attempts") >= MIN_DAILY_ATTEMPTS))
@@ -297,9 +285,7 @@ def score_hourly_reason_rate(fct: pl.LazyFrame) -> pl.LazyFrame:
 
     # Dense day x reason grid per segment, so a rolling window of 14 rows spans 14 days even
     # when a reason did not occur on some of them.
-    daily_attempts = attempts.group_by(*segment, "local_date").agg(
-        pl.len().alias("day_attempts")
-    )
+    daily_attempts = attempts.group_by(*segment, "local_date").agg(pl.len().alias("day_attempts"))
     daily_events = with_reason.group_by(*segment, "decline_reason", "local_date").agg(
         pl.len().alias("day_events")
     )
@@ -329,9 +315,7 @@ def score_hourly_reason_rate(fct: pl.LazyFrame) -> pl.LazyFrame:
         .join(baseline, on=[*series, "local_date"], how="left")
         .with_columns(
             (pl.col("events") / pl.col("attempts")).alias("rate"),
-            _z_score(
-                pl.col("events"), pl.col("attempts"), pl.col("baseline_rate")
-            ).alias("z"),
+            _z_score(pl.col("events"), pl.col("attempts"), pl.col("baseline_rate")).alias("z"),
         )
         .with_columns(
             (
@@ -382,9 +366,7 @@ def score_merchants_against_peers(fct: pl.LazyFrame) -> pl.LazyFrame:
         ``peer_attempts``, ``peer_rate``, ``gap`` and ``is_anomaly``.
     """
     keys = ["merchant_id", *PEER_GROUP]
-    per_merchant = performance(
-        aggregate_additive_measures(fct, [*keys, "payment_method"]), keys
-    )
+    per_merchant = performance(aggregate_additive_measures(fct, [*keys, "payment_method"]), keys)
     long = pl.concat(
         [
             per_merchant.select(
@@ -414,9 +396,7 @@ def score_merchants_against_peers(fct: pl.LazyFrame) -> pl.LazyFrame:
     category_attempts = others("attempts", PEER_GROUP)
     use_category = category_attempts > 0
     peer_attempts = (
-        pl.when(use_category)
-        .then(category_attempts)
-        .otherwise(others("attempts", ["country"]))
+        pl.when(use_category).then(category_attempts).otherwise(others("attempts", ["country"]))
     )
     peer_successes = (
         pl.when(use_category)

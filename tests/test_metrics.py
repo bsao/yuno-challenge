@@ -81,9 +81,7 @@ def test_wilson_interval_expr_matches_hand_computed_values() -> None:
 def test_wilson_interval_is_null_without_trials_and_rejects_invalid_input() -> None:
     """Zero trials give null bounds in Polars and an error in the scalar function."""
     low, high = wilson_interval_expr(pl.col("successes"), pl.col("n"))
-    result = pl.DataFrame({"successes": [0], "n": [0]}).select(
-        low.alias("low"), high.alias("high")
-    )
+    result = pl.DataFrame({"successes": [0], "n": [0]}).select(low.alias("low"), high.alias("high"))
     assert result.row(0) == (None, None)
 
     with pytest.raises(ValueError, match="invalid proportion"):
@@ -92,9 +90,7 @@ def test_wilson_interval_is_null_without_trials_and_rejects_invalid_input() -> N
         wilson_interval(11, 10)
 
 
-def test_auth_rate_counts_refunded_as_approved_and_excludes_pending_and_expired() -> (
-    None
-):
+def test_auth_rate_counts_refunded_as_approved_and_excludes_pending_and_expired() -> None:
     """70 approved + 5 refunded over 100 attempts is 75%; 7 pending and 9 expired are ignored."""
     lf = _measures(
         [
@@ -207,9 +203,7 @@ def test_completion_rate_applies_to_voucher_methods_only() -> None:
 
     assert oxxo["voucher_attempts"] == 100  # 62 paid + 38 expired
     assert oxxo["completion_rate"] == pytest.approx(0.62)
-    assert oxxo["auth_rate"] == pytest.approx(
-        62 / 63
-    )  # expired is not an authorization attempt
+    assert oxxo["auth_rate"] == pytest.approx(62 / 63)  # expired is not an authorization attempt
     assert card["voucher_attempts"] == 0
     assert card["completion_rate"] is None
     assert card["completion_wilson_low"] is None

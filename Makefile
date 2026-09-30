@@ -28,7 +28,7 @@ check:
 	$(PYTHON) -m pytest
 
 app:
-	$(PYTHON) -m streamlit run app/streamlit_app.py
+	PYTHONPATH=. $(PYTHON) -m streamlit run app/streamlit_app.py
 
 up:
 	$(COMPOSE) up --build

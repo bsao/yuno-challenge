@@ -153,9 +153,7 @@ def performance(lf: pl.LazyFrame, dims: Sequence[str]) -> pl.LazyFrame:
     wilson_low, wilson_high = wilson_interval_expr(approved, attempts)
     voucher_paid = pl.col("_voucher_paid")
     voucher_attempts = voucher_paid + pl.col("_voucher_expired")
-    completion_low, completion_high = wilson_interval_expr(
-        voucher_paid, voucher_attempts
-    )
+    completion_low, completion_high = wilson_interval_expr(voucher_paid, voucher_attempts)
     return aggregated.select(
         *dims,
         attempts.alias("attempts"),

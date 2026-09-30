@@ -325,3 +325,57 @@ metrics module, no detector code):
   the footprint of anomaly c.
 - OXXO by merchant: `mrc_037` expires 96.0% of 4,730 vouchers; the next merchant is at 51.6% on
   only 62 vouchers.
+
+## Step 6: dashboard
+
+Proposed commit: `feat(app): add Streamlit dashboard with overview, performance, failures and anomalies`
+
+**Delivered**
+
+- `app/streamlit_app.py`: sidebar filters (date range, country) and six tabs.
+- `.streamlit/config.toml` (light theme), `PYTHONPATH` set in the `Dockerfile` and in `make app` so
+  the app can import `analytics` and `pipeline`.
+- Screenshots of the four implemented tabs in `docs/screenshots/`.
+
+**Decisions**: D11.
+
+**Coverage against the step specification**
+
+| Requirement | Status | Evidence |
+| --- | --- | --- |
+| Reads the marts with `st.cache_data` | Met | six cached loaders over lazy Parquet scans |
+| Sidebar filters: date range and country | Met | both applied to every view |
+| Overview: attempts, authorization rate, GMV USD, net GMV, daily trend | Met | four tiles, daily authorization rate with Wilson band, daily net GMV |
+| Performance: country x method heatmap with sample size | Met | rate and `n` in each cell, completion rate for OXXO |
+| Performance: PSP comparison with Wilson intervals | Met | dot and interval per country and PSP, plus a table view |
+| Performance: top and worst merchants | Met | 10 each, minimum 200 attempts |
+| Failures: reasons, hour x weekday heatmap, amount buckets, OXXO expirations | Met | five charts and a table |
+| Anomalies: flagged table and a chart highlighting the anomalous days | Met | 8 flags; daily decline rate with baseline and marked days |
+| Merchant Health and Cost: placeholders | Met | one info box each |
+| Every chart has a one line caption stating the business decision | Met | 10 charts and the two merchant tables, each with a "Decision:" caption |
+| Rebuild with docker compose and confirm it works | Met | see below |
+
+**Verification**
+
+- `make check` passes (62 tests).
+- `docker-compose down -v` then `docker-compose up --build`: the `pipeline` container generated,
+  ingested and transformed at full scale and exited 0; the `app` container became healthy;
+  `curl http://localhost:8501/_stcore/health` returned 200.
+- Every tab opened in a browser against the container: Performance 2 charts and 3 tables, Failures
+  5 charts and 1 table, Anomalies 1 chart and 1 table, no exception element on any tab.
+- The standalone `docker-compose` binary was used because the local Docker CLI has no compose
+  plugin; it is the same Compose engine as `docker compose`.
+
+Double check, the Overview tiles read from the page served by the container against an eager
+recomputation from the local staging file (different machine state, different code path):
+
+| Number | Dashboard (container) | Staging recompute (local) |
+| --- | --- | --- |
+| Attempts | 1,145,522 | 1,145,522 |
+| Authorization rate | 79.3% | 79.3% |
+| GMV (USD) | $38,143,368 | $38,143,368 |
+| Net GMV (USD) | $37,425,324 | $37,425,324 |
+
+The container's pipeline log also matches the local run line for line: 2,430,825 deliveries,
+23,814 duplicates removed, 33,197 out of order events, 1,200,000 transactions, 1,440 aggregate rows
+and the same four Colombia PSP lines.

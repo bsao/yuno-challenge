@@ -44,4 +44,12 @@ make check
 
 ## Status
 
-The pipeline runs end to end (`make pipeline` generates, ingests, builds the marts and logs the headline findings); failure analysis and anomaly detection are in `analytics/anomalies.py`. The dashboard views and the health and cost analyses are stubs.
+The pipeline runs end to end and the dashboard has four working tabs (Overview, Performance,
+Failures, Anomalies). Merchant Health and Cost are placeholders.
+
+## Screenshots
+
+![Overview](docs/screenshots/01_overview.png)
+![Performance](docs/screenshots/02_performance.png)
+![Failures](docs/screenshots/03_failures.png)
+![Anomalies](docs/screenshots/04_anomalies.png)

@@ -204,3 +204,30 @@ expiration per ticket bucket and per merchant.
   alone in its country and category falls back to country peers, and `peer_scope` records which
   was used.
 - **Limitation**: the merchant authorization rate is not adjusted for payment method mix.
+
+## D11. Dashboard
+
+`app/streamlit_app.py` holds no metric logic: every number comes from `analytics/metrics.py` or
+`analytics/anomalies.py`. The page only filters, caches and draws.
+
+- **Caching**: each `st.cache_data` function scans the Parquet marts lazily and returns a small
+  aggregated frame keyed by the sidebar filters. The 1.2 million row fact table is never loaded
+  into the session, so a filter change costs one Polars scan and a repeated view costs nothing.
+- **Filters**: date range (local dates) and country. The anomaly detectors need 14 days of
+  history, so they always score the whole window for the selected countries; the date range then
+  selects which flags are shown.
+- **One caption per chart** names the business decision the chart supports, so the page reads as a
+  set of decisions rather than a set of plots.
+- **Sample size everywhere**: rates carry `n` in the cell, the label or the hover, and Wilson
+  intervals as a band, error bars or text.
+- **Chart choices**: no dual axes (authorization rate and GMV are two charts); a single hue
+  sequential scale for heatmaps; PSP colours are fixed per PSP so a filter never repaints them;
+  red is reserved for anomalous days. The four series palette was checked for colour vision
+  deficiency separation; two of its colours have low contrast on the light surface, so those
+  charts also carry direct labels or a table view.
+- **Light theme pinned** in `.streamlit/config.toml`, because the palette was validated against
+  the light surface only.
+- **Merchant ranking** requires at least 200 attempts, so a merchant with a handful of
+  transactions cannot top either list.
+- **Typing trade off** (see D2): the app is outside mypy strict, which is acceptable because it
+  contains presentation code only.
