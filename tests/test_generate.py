@@ -20,11 +20,12 @@ import pytest
 from data_gen.generate import GeneratorConfig, generate
 
 N_TRANSACTIONS = 60_000
-CURRENCY_BY_COUNTRY = {"MX": "MXN", "CO": "COP", "CL": "CLP"}
+CURRENCY_BY_COUNTRY = {"MX": "MXN", "CO": "COP", "CL": "CLP", "BR": "BRL"}
 METHODS_BY_COUNTRY = {
     "MX": {"card", "oxxo", "spei"},
     "CO": {"card", "pse"},
     "CL": {"card", "webpay"},
+    "BR": {"card", "pix", "boleto"},
 }
 REASONS_BY_STATUS = {
     "declined": {"insufficient_funds", "card_declined", "fraud_suspected"},
@@ -140,7 +141,12 @@ def test_deliveries_respect_the_raw_contract(dataset: Dataset) -> None:
 def test_window_covers_the_last_90_local_days(dataset: Dataset) -> None:
     """Transactions are created on each of the 90 local days ending on the end date."""
     _, rows, _ = dataset
-    zones = {"MX": "America/Mexico_City", "CO": "America/Bogota", "CL": "America/Santiago"}
+    zones = {
+        "MX": "America/Mexico_City",
+        "CO": "America/Bogota",
+        "CL": "America/Santiago",
+        "BR": "America/Sao_Paulo",
+    }
     days = {_local(row["created_at"], zones[row["country"]]).date() for row in rows}
     assert min(days) == date(2026, 7, 3)
     assert max(days) == date(2026, 9, 30)

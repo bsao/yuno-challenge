@@ -40,7 +40,7 @@ def test_generates_raw_data_when_missing(tmp_path: Path, caplog: pytest.LogCaptu
     assert (tmp_path / "marts" / "fct_transactions.parquet").is_file()
     assert (tmp_path / "marts" / "agg_daily.parquet").is_file()
     highlights = [r.getMessage() for r in caplog.records if r.getMessage().startswith("highlight=")]
-    assert sum("method_ranking" in line for line in highlights) == 3
+    assert sum("method_ranking" in line for line in highlights) == 4
     assert sum("psp_comparison" in line for line in highlights) == 4
     assert _logged_stages(caplog) == [
         ("generate", "done"),

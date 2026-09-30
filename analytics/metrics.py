@@ -32,7 +32,7 @@ import polars as pl
 
 # Two sided 95% confidence.
 WILSON_Z = 1.96
-VOUCHER_METHODS: tuple[str, ...] = ("oxxo",)
+VOUCHER_METHODS: tuple[str, ...] = ("oxxo", "boleto")
 # Final statuses that count as an authorization attempt, split by outcome.
 APPROVED_STATUSES: tuple[str, ...] = ("approved", "refunded")
 NOT_APPROVED_STATUSES: tuple[str, ...] = ("declined", "failed")

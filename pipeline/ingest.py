@@ -48,9 +48,9 @@ RAW_SCHEMA: dict[str, type[pl.DataType]] = {
     "event_at": pl.String,
 }
 
-COUNTRIES: tuple[str, ...] = ("MX", "CO", "CL")
-CURRENCIES: tuple[str, ...] = ("MXN", "COP", "CLP")
-PAYMENT_METHODS: tuple[str, ...] = ("card", "oxxo", "spei", "pse", "webpay")
+COUNTRIES: tuple[str, ...] = ("MX", "CO", "CL", "BR")
+CURRENCIES: tuple[str, ...] = ("MXN", "COP", "CLP", "BRL")
+PAYMENT_METHODS: tuple[str, ...] = ("card", "oxxo", "spei", "pse", "webpay", "pix", "boleto")
 CARD_BRANDS: tuple[str, ...] = ("visa", "mastercard")
 PSPS: tuple[str, ...] = ("PSP_A", "PSP_B", "PSP_C", "PSP_D")
 DECLINE_REASONS: tuple[str, ...] = (
@@ -76,10 +76,16 @@ TIME_ZONES: dict[str, str] = {
     "MX": "America/Mexico_City",
     "CO": "America/Bogota",
     "CL": "America/Santiago",
+    "BR": "America/Sao_Paulo",
 }
 # Decimal places of each currency (CLP has none) and fixed, illustrative USD rates.
-MINOR_UNIT_EXPONENT: dict[str, int] = {"MXN": 2, "COP": 2, "CLP": 0}
-USD_PER_MAJOR_UNIT: dict[str, float] = {"MXN": 0.054, "COP": 0.00025, "CLP": 0.00105}
+MINOR_UNIT_EXPONENT: dict[str, int] = {"MXN": 2, "COP": 2, "CLP": 0, "BRL": 2}
+USD_PER_MAJOR_UNIT: dict[str, float] = {
+    "MXN": 0.054,
+    "COP": 0.00025,
+    "CLP": 0.00105,
+    "BRL": 0.18,
+}
 
 _LATEST_ORDER: tuple[str, ...] = ("event_at", "status_rank", "event_id")
 

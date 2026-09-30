@@ -22,7 +22,9 @@ Assumptions:
       transactions can still be ``pending``.
     * Every event carries the full transaction attributes; they never change between events.
     * Refunds are always full refunds. Each merchant operates in one country.
-    * Cards are one payment method (``card``) with ``card_brand`` visa or mastercard.
+    * Cards are one payment method (``card``) with ``card_brand`` visa or mastercard. Local
+      methods: OXXO and SPEI (Mexico), PSE (Colombia), Webpay (Chile), PIX and Boleto (Brazil).
+      OXXO and Boleto are cash vouchers that are paid later or expire.
     * The generator shares no code with the pipeline on purpose: it plays the upstream system and
       the file contract is the only interface.
 """
@@ -70,23 +72,32 @@ SIZE_TIERS: tuple[tuple[str, int], ...] = (
     ("small", MERCHANT_COUNT),
 )
 
-COUNTRIES: tuple[str, ...] = ("MX", "CO", "CL")
-COUNTRY_MERCHANT_SHARE: tuple[float, ...] = (0.5, 0.3, 0.2)
-CURRENCIES: tuple[str, ...] = ("MXN", "COP", "CLP")
-TIME_ZONES: tuple[str, ...] = ("America/Mexico_City", "America/Bogota", "America/Santiago")
-MEDIAN_AMOUNT_MAJOR: tuple[float, ...] = (600.0, 120_000.0, 25_000.0)
+COUNTRIES: tuple[str, ...] = ("MX", "CO", "CL", "BR")
+COUNTRY_MERCHANT_SHARE: tuple[float, ...] = (0.40, 0.20, 0.15, 0.25)
+CURRENCIES: tuple[str, ...] = ("MXN", "COP", "CLP", "BRL")
+TIME_ZONES: tuple[str, ...] = (
+    "America/Mexico_City",
+    "America/Bogota",
+    "America/Santiago",
+    "America/Sao_Paulo",
+)
+MEDIAN_AMOUNT_MAJOR: tuple[float, ...] = (600.0, 120_000.0, 25_000.0, 180.0)
+# Currencies whose tickets carry cents; COP and CLP tickets are whole units.
+CURRENCIES_WITH_CENTS: tuple[str, ...] = ("MXN", "BRL")
 # Minor units per major unit. COP tickets are whole pesos expressed in centavos; CLP has none.
-MINOR_PER_MAJOR: tuple[int, ...] = (100, 100, 1)
+MINOR_PER_MAJOR: tuple[int, ...] = (100, 100, 1, 100)
 AMOUNT_SIGMA = 0.8
 
-METHODS: tuple[str, ...] = ("card", "oxxo", "spei", "pse", "webpay")
+METHODS: tuple[str, ...] = ("card", "oxxo", "spei", "pse", "webpay", "pix", "boleto")
 CARD_METHOD = "card"
-VOUCHER_METHOD = "oxxo"
+# Cash vouchers: the customer receives a code and pays later, or the voucher expires.
+VOUCHER_METHODS: tuple[str, ...] = ("oxxo", "boleto")
 # Per country: (method, share of that country's transactions).
 METHOD_MIX: dict[str, tuple[tuple[str, float], ...]] = {
     "MX": (("card", 0.70), ("oxxo", 0.12), ("spei", 0.18)),
     "CO": (("card", 0.65), ("pse", 0.35)),
     "CL": (("card", 0.70), ("webpay", 0.30)),
+    "BR": (("card", 0.45), ("pix", 0.40), ("boleto", 0.15)),
 }
 CARD_BRANDS: tuple[str, ...] = ("visa", "mastercard")
 CARD_BRAND_SHARE: tuple[float, ...] = (0.6, 0.4)
@@ -112,6 +123,8 @@ METHOD_PCT_FEE_ADJUSTMENT: dict[str, float] = {
     "spei": -1.6,
     "pse": -1.2,
     "webpay": -0.8,
+    "pix": -1.9,
+    "boleto": 0.4,
 }
 
 STATUSES: tuple[str, ...] = ("approved", "declined", "failed", "expired", "pending", "refunded")
@@ -123,11 +136,14 @@ BASE_OUTCOME: dict[str, tuple[float, float, float, float, float]] = {
     "spei": (0.880, 0.060, 0.030, 0.020, 0.010),
     "pse": (0.800, 0.130, 0.040, 0.020, 0.010),
     "webpay": (0.840, 0.115, 0.030, 0.010, 0.005),
+    "pix": (0.905, 0.050, 0.025, 0.015, 0.005),
+    "boleto": (0.580, 0.000, 0.010, 0.390, 0.020),
 }
 REFUND_SHARE_OF_APPROVED = 0.02
 # Segment effects on authorization (probability mass moved between approved and declined).
 CO_CARD_DECLINE_SHIFT = 0.04
 CL_CARD_APPROVAL_SHIFT = 0.04
+BR_CARD_DECLINE_SHIFT = 0.03
 MASTERCARD_DECLINE_SHIFT = 0.02
 PSP_B_DECLINE_SHIFT = 0.03
 PSP_B_CL_APPROVAL_SHIFT = 0.06
@@ -172,6 +188,7 @@ DECLINE_SPIKE_FIRST_DAY = 60
 DECLINE_SPIKE_DAYS = 3
 DECLINE_SPIKE_FACTOR = 2.0
 OXXO_EXPIRY_COUNTRY = "MX"
+OXXO_EXPIRY_METHOD = "oxxo"
 OXXO_EXPIRY_MERCHANT_RANK = 2  # third largest Mexican merchant
 OXXO_EXPIRY_OUTCOME: tuple[float, float, float, float, float] = (0.04, 0.0, 0.0, 0.95, 0.01)
 TIMEOUT_SPIKE_PSP = "PSP_B"
@@ -364,7 +381,8 @@ def _sample_transactions(
 
     major = np.asarray(MEDIAN_AMOUNT_MAJOR)[country] * rng.lognormal(0.0, AMOUNT_SIGMA, size=n)
     whole_major = np.maximum(np.rint(major), 1.0).astype(np.int64)
-    cents = np.where(country == COUNTRIES.index("MX"), rng.integers(0, 100, size=n), 0)
+    has_cents = np.isin(country, [CURRENCIES.index(name) for name in CURRENCIES_WITH_CENTS])
+    cents = np.where(has_cents, rng.integers(0, 100, size=n), 0)
     amount_minor = whole_major * np.asarray(MINOR_PER_MAJOR, dtype=np.int64)[country] + cents
 
     # Segment effects: authorization differs by country, brand and PSP.
@@ -373,6 +391,10 @@ def _sample_transactions(
     in_cl = country == COUNTRIES.index("CL")
     _shift(probs, is_card & in_co, APPROVED, DECLINED, CO_CARD_DECLINE_SHIFT)
     _shift(probs, is_card & in_cl, DECLINED, APPROVED, CL_CARD_APPROVAL_SHIFT)
+    _shift(
+        probs, is_card & (country == COUNTRIES.index("BR")), APPROVED, DECLINED,
+        BR_CARD_DECLINE_SHIFT,
+    )  # fmt: skip
     _shift(
         probs, card_brand == CARD_BRANDS.index("mastercard"), APPROVED, DECLINED,
         MASTERCARD_DECLINE_SHIFT,
@@ -397,7 +419,7 @@ def _sample_transactions(
     _shift(probs, decline_spike, APPROVED, DECLINED, extra_declines)
     # Planted anomaly b: one Mexican merchant whose OXXO vouchers almost always expire.
     oxxo_expiry = (merchant == merchants.oxxo_expiry_merchant) & (
-        method == METHODS.index(VOUCHER_METHOD)
+        method == METHODS.index(OXXO_EXPIRY_METHOD)
     )
     probs[oxxo_expiry] = OXXO_EXPIRY_OUTCOME
     # Planted anomaly c: network timeouts for one PSP during the night of one weekend.
@@ -516,7 +538,7 @@ def _write_reference_files(config: GeneratorConfig, merchants: _Merchants) -> No
                 "description": "One merchant whose OXXO vouchers expire about 95% of the time.",
                 "merchant_id": _merchant_id(merchants.oxxo_expiry_merchant),
                 "country": OXXO_EXPIRY_COUNTRY,
-                "payment_method": VOUCHER_METHOD,
+                "payment_method": OXXO_EXPIRY_METHOD,
                 "expected_expiration_rate": OXXO_EXPIRY_OUTCOME[EXPIRED],
             },
             {
@@ -562,7 +584,7 @@ def generate(config: GeneratorConfig) -> dict[str, Any]:
 
     # Lifecycle: every transaction emits "pending"; resolved ones emit a final event; some
     # approved ones emit "refunded" later. Events after the snapshot are not emitted.
-    is_voucher = txn.method == METHODS.index(VOUCHER_METHOD)
+    is_voucher = np.isin(txn.method, [METHODS.index(name) for name in VOUCHER_METHODS])
     resolution = np.where(
         txn.method == METHODS.index(CARD_METHOD),
         rng.exponential(CARD_RESOLUTION_MEAN_MS, size=n),

@@ -92,7 +92,7 @@ def _with_amount_bucket(fct: pl.LazyFrame) -> pl.LazyFrame:
 
 def _outcome_rates_by(fct: pl.LazyFrame, dims: Sequence[str]) -> pl.LazyFrame:
     """Aggregate transactions to ``dims`` and compute the decline, failure and expiration rates."""
-    measures = aggregate_additive_measures(fct, [*dims, "payment_method"])
+    measures = aggregate_additive_measures(fct, list(dict.fromkeys([*dims, "payment_method"])))
     return outcome_rates(measures, dims)
 
 
@@ -161,46 +161,45 @@ def decline_rate_by_amount_bucket(fct: pl.LazyFrame, dims: Sequence[str] = ()) -
     )
 
 
-def oxxo_expiration_by_amount_bucket(fct: pl.LazyFrame) -> pl.LazyFrame:
-    """Compute the voucher expiration rate per USD ticket size bucket.
+def voucher_expiration_by_amount_bucket(fct: pl.LazyFrame) -> pl.LazyFrame:
+    """Compute the voucher expiration rate per voucher method and USD ticket size bucket.
 
-    Grain: one row per ``amount_bucket``, over voucher transactions only.
+    Grain: one row per ``payment_method`` x ``amount_bucket``, over voucher methods (OXXO,
+    Boleto) only.
 
     Args:
         fct: One row per transaction, with ``amount_usd``.
 
     Returns:
-        ``amount_bucket_order``, ``amount_bucket``, ``voucher_attempts``, ``expired``,
-        ``expiration_rate`` and its Wilson bounds, for buckets with resolved vouchers.
+        ``payment_method``, ``amount_bucket_order``, ``amount_bucket``, ``voucher_attempts``,
+        ``expired``, ``expiration_rate`` and its Wilson bounds, for buckets with resolved vouchers.
     """
+    dims = ["payment_method", "amount_bucket_order", "amount_bucket"]
     return (
-        _outcome_rates_by(_with_amount_bucket(fct), ["amount_bucket_order", "amount_bucket"])
+        _outcome_rates_by(_with_amount_bucket(fct), dims)
         .filter(pl.col("voucher_attempts") > 0)
-        .select(
-            "amount_bucket_order",
-            "amount_bucket",
-            "voucher_attempts",
-            pl.col("^expir.*$"),
-        )
+        .select(*dims, "voucher_attempts", pl.col("^expir.*$"))
     )
 
 
-def oxxo_expiration_by_merchant(fct: pl.LazyFrame) -> pl.LazyFrame:
-    """Compute the voucher expiration rate per merchant.
+def voucher_expiration_by_merchant(fct: pl.LazyFrame) -> pl.LazyFrame:
+    """Compute the voucher expiration rate per merchant and voucher method.
 
-    Grain: one row per ``merchant_id``, over voucher transactions only.
+    Grain: one row per ``merchant_id`` x ``payment_method``, over voucher methods only.
 
     Args:
         fct: One row per transaction.
 
     Returns:
-        ``merchant_id``, ``voucher_attempts``, ``expired``, ``expiration_rate`` and its Wilson
-        bounds, for merchants with resolved vouchers, sorted by descending expiration rate.
+        ``merchant_id``, ``payment_method``, ``voucher_attempts``, ``expired``,
+        ``expiration_rate`` and its Wilson bounds, for merchants with resolved vouchers, sorted
+        by descending expiration rate.
     """
+    dims = ["merchant_id", "payment_method"]
     return (
-        _outcome_rates_by(fct, ["merchant_id"])
+        _outcome_rates_by(fct, dims)
         .filter(pl.col("voucher_attempts") > 0)
-        .select("merchant_id", "voucher_attempts", pl.col("^expir.*$"))
+        .select(*dims, "voucher_attempts", pl.col("^expir.*$"))
         .sort("expiration_rate", "merchant_id", descending=[True, False])
     )
 

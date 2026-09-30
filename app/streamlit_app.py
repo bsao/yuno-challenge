@@ -41,7 +41,7 @@ FEES_PATH = MARTS_DIR.parent / "raw" / "psp_fees.csv"
 
 MIN_MERCHANT_ATTEMPTS = 200
 MERCHANT_ROWS = 10
-COUNTRY_NAMES = {"MX": "Mexico", "CO": "Colombia", "CL": "Chile"}
+COUNTRY_NAMES = {"MX": "Mexico", "CO": "Colombia", "CL": "Chile", "BR": "Brazil"}
 WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 # Palette validated for colour vision deficiency on the light surface. Colour follows the
@@ -57,6 +57,7 @@ ORANGE = "#eb6834"
 CRITICAL = "#d03b3b"
 PSP_COLORS = {"PSP_A": BLUE, "PSP_B": ORANGE, "PSP_C": "#1baf7a", "PSP_D": "#eda100"}
 STATUS_COLORS = {"declined": BLUE, "failed": ORANGE}
+VOUCHER_COLORS = {"oxxo": BLUE, "boleto": ORANGE}
 SEQUENTIAL = ["#cde2fb", "#86b6ef", "#3987e5", "#1c5cab", "#0d366b"]
 
 Filters = tuple[date, date, tuple[str, ...]]
@@ -111,8 +112,8 @@ def load_failure_views(filters: Filters) -> dict[str, pl.DataFrame]:
         "reasons": anomalies.reason_breakdown(fct).collect(),
         "heatmap": anomalies.decline_heatmap(fct).collect(),
         "amount": anomalies.decline_rate_by_amount_bucket(fct).collect(),
-        "oxxo_amount": anomalies.oxxo_expiration_by_amount_bucket(fct).collect(),
-        "oxxo_merchant": anomalies.oxxo_expiration_by_merchant(fct).collect(),
+        "voucher_amount": anomalies.voucher_expiration_by_amount_bucket(fct).collect(),
+        "voucher_merchant": anomalies.voucher_expiration_by_merchant(fct).collect(),
     }
 
 
@@ -306,8 +307,8 @@ def render_performance(filters: Filters) -> None:
     heatmap.update_yaxes(showgrid=False)
     _show(
         _style(heatmap, height=120 + 80 * len(countries)),
-        "choose which methods to promote at checkout in each country. For OXXO read the "
-        "completion rate: unpaid vouchers expire instead of declining.",
+        "choose which methods to promote at checkout in each country. For OXXO and "
+        "Boleto read the completion rate: unpaid vouchers expire instead of declining.",
     )
 
     by_psp = load_performance(filters, ("country", "psp")).filter(pl.col("attempts") > 0)
@@ -496,61 +497,79 @@ def render_failures(filters: Filters) -> None:
         "decide whether high tickets need 3DS, instalments or a different route.",
     )
 
-    oxxo_amount, oxxo_merchant = views["oxxo_amount"], views["oxxo_merchant"].head(MERCHANT_ROWS)
-    if oxxo_amount.height == 0:
-        st.info("No OXXO vouchers in the current filters. OXXO is only offered in Mexico.")
+    by_amount, by_merchant = views["voucher_amount"], views["voucher_merchant"].head(MERCHANT_ROWS)
+    if by_amount.height == 0:
+        st.info("No voucher payments in the current filters (OXXO in Mexico, Boleto in Brazil).")
         return
     left, right = st.columns(2)
-    by_ticket = go.Figure(
+    ticket_chart = go.Figure()
+    for method, color in VOUCHER_COLORS.items():
+        rows = by_amount.filter(pl.col("payment_method") == method)
+        if rows.height == 0:
+            continue
+        ticket_chart.add_trace(
+            go.Bar(
+                x=rows.get_column("amount_bucket").to_list(),
+                y=rows.get_column("expiration_rate").to_list(),
+                customdata=rows.select("voucher_attempts").rows(),
+                error_y=_error_bars(
+                    rows,
+                    "expiration_rate",
+                    "expiration_rate_wilson_low",
+                    "expiration_rate_wilson_high",
+                ),
+                marker={"color": color, "cornerradius": 4},
+                name=method,
+                hovertemplate=(
+                    method + " %{x} USD<br>Expiration rate %{y:.1%}<br>"
+                    "n = %{customdata[0]:,}<extra></extra>"
+                ),
+            )
+        )
+    ticket_chart.update_layout(
+        title="Voucher expiration rate by ticket size (USD)", barmode="group", bargap=0.3
+    )
+    ticket_chart.update_yaxes(tickformat=".0%", range=[0, 1])
+    with left:
+        _show(
+            _style(ticket_chart),
+            "decide whether voucher payment reminders should target a ticket size.",
+        )
+    ordered = by_merchant.sort("expiration_rate")
+    merchant_chart = go.Figure(
         go.Bar(
-            x=oxxo_amount.get_column("amount_bucket").to_list(),
-            y=oxxo_amount.get_column("expiration_rate").to_list(),
-            customdata=oxxo_amount.select("voucher_attempts").rows(),
-            error_y=_error_bars(
-                oxxo_amount,
+            x=ordered.get_column("expiration_rate").to_list(),
+            y=[f"{m} · {p}" for m, p in ordered.select("merchant_id", "payment_method").rows()],
+            orientation="h",
+            customdata=ordered.select(
+                "voucher_attempts", "expiration_rate_wilson_low", "expiration_rate_wilson_high"
+            ).rows(),
+            error_x=_error_bars(
+                ordered,
                 "expiration_rate",
                 "expiration_rate_wilson_low",
                 "expiration_rate_wilson_high",
             ),
-            marker={"color": BLUE, "cornerradius": 4},
-            width=0.55,
+            marker={
+                "color": [VOUCHER_COLORS[p] for p in ordered.get_column("payment_method")],
+                "cornerradius": 4,
+            },
+            text=[f"n = {n:,}" for n in ordered.get_column("voucher_attempts")],
+            textposition="inside",
+            insidetextanchor="start",
+            textfont={"color": "white"},
             hovertemplate=(
-                "%{x} USD<br>Expiration rate %{y:.1%}<br>n = %{customdata[0]:,}<extra></extra>"
+                "%{y}<br>Expiration rate %{x:.1%}<br>95% interval %{customdata[1]:.1%} to "
+                "%{customdata[2]:.1%}<br>n = %{customdata[0]:,}<extra></extra>"
             ),
         )
     )
-    by_ticket.update_layout(title="OXXO expiration rate by ticket size (USD)")
-    by_ticket.update_yaxes(tickformat=".0%", range=[0, 1])
-    with left:
-        _show(
-            _style(by_ticket),
-            "decide whether voucher reminders should target a ticket size.",
-        )
-    ordered = oxxo_merchant.sort("expiration_rate")
-    by_merchant = go.Figure(
-        go.Bar(
-            x=ordered.get_column("expiration_rate").to_list(),
-            y=ordered.get_column("merchant_id").to_list(),
-            orientation="h",
-            customdata=ordered.select("voucher_attempts").rows(),
-            marker={"color": BLUE, "cornerradius": 4},
-            text=[
-                f"{rate:.0%} · n = {n:,}"
-                for rate, n in ordered.select("expiration_rate", "voucher_attempts").rows()
-            ],
-            textposition="outside",
-            textfont={"color": INK_SECONDARY},
-            hovertemplate=(
-                "%{y}<br>Expiration rate %{x:.1%}<br>n = %{customdata[0]:,}<extra></extra>"
-            ),
-        )
-    )
-    by_merchant.update_layout(title="OXXO expiration rate: 10 highest merchants")
-    by_merchant.update_xaxes(tickformat=".0%", range=[0, 1.35])
+    merchant_chart.update_layout(title="Voucher expiration rate: 10 highest merchants")
+    merchant_chart.update_xaxes(tickformat=".0%", range=[0, 1.05])
     with right:
         _show(
-            _style(by_merchant),
-            "find merchants whose voucher flow is broken; read small n with caution.",
+            _style(merchant_chart),
+            "find merchants whose voucher flow is broken; wide intervals mean small samples.",
         )
 
 

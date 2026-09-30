@@ -137,26 +137,26 @@ def test_amount_usd_uses_the_currency_exponent_and_fixed_rate() -> None:
     """USD amounts match hand computed values, including zero decimal CLP."""
     frame = pl.DataFrame(
         {
-            "country": ["MX", "CO", "CL"],
-            "currency": ["MXN", "COP", "CLP"],
-            "amount_minor": [12_345, 5_000_000, 10_000],
-            "created_at": [_at(0)] * 3,
+            "country": ["MX", "CO", "CL", "BR"],
+            "currency": ["MXN", "COP", "CLP", "BRL"],
+            "amount_minor": [12_345, 5_000_000, 10_000, 25_050],
+            "created_at": [_at(0)] * 4,
         }
     ).lazy()
 
     amounts = add_derived_columns(frame).collect().get_column("amount_usd").to_list()
 
-    # 123.45 MXN * 0.054; 50,000.00 COP * 0.00025; 10,000 CLP * 0.00105.
-    assert amounts == pytest.approx([6.6663, 12.5, 10.5])
+    # 123.45 MXN * 0.054; 50,000.00 COP * 0.00025; 10,000 CLP * 0.00105; 250.50 BRL * 0.18.
+    assert amounts == pytest.approx([6.6663, 12.5, 10.5, 45.09])
 
 
 def test_local_time_follows_each_country_time_zone() -> None:
     """Local hour and weekday are derived per country, including Chile's daylight saving."""
     frame = pl.DataFrame(
         {
-            "country": ["MX", "CO", "CL", "CL"],
-            "currency": ["MXN", "COP", "CLP", "CLP"],
-            "amount_minor": [100, 100, 100, 100],
+            "country": ["MX", "CO", "CL", "CL", "BR"],
+            "currency": ["MXN", "COP", "CLP", "CLP", "BRL"],
+            "amount_minor": [100, 100, 100, 100, 100],
             "created_at": [
                 # Tuesday 03:30 UTC is Monday 21:30 in Mexico City (UTC-6).
                 datetime(2026, 9, 1, 3, 30, tzinfo=UTC),
@@ -166,6 +166,8 @@ def test_local_time_follows_each_country_time_zone() -> None:
                 datetime(2026, 9, 5, 12, 0, tzinfo=UTC),
                 # Monday 12:00 UTC is 09:00 in Santiago after the change (UTC-3).
                 datetime(2026, 9, 7, 12, 0, tzinfo=UTC),
+                # Sunday 01:15 UTC is Saturday 22:15 in Sao Paulo (UTC-3).
+                datetime(2026, 9, 6, 1, 15, tzinfo=UTC),
             ],
         }
     ).lazy()
@@ -177,6 +179,7 @@ def test_local_time_follows_each_country_time_zone() -> None:
         datetime(2026, 8, 31, 22, 30),
         datetime(2026, 9, 5, 8, 0),
         datetime(2026, 9, 7, 9, 0),
+        datetime(2026, 9, 5, 22, 15),
     ]
-    assert result.get_column("local_hour").to_list() == [21, 22, 8, 9]
-    assert result.get_column("local_weekday").to_list() == [1, 1, 6, 1]
+    assert result.get_column("local_hour").to_list() == [21, 22, 8, 9, 22]
+    assert result.get_column("local_weekday").to_list() == [1, 1, 6, 1, 6]

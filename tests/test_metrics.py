@@ -258,3 +258,21 @@ def test_outcome_rates_split_declines_failures_and_voucher_expiration() -> None:
         total["expiration_rate_wilson_low"],
         total["expiration_rate_wilson_high"],
     ) == (pytest.approx(wilson_interval(10, 40)))
+
+
+def test_boleto_is_a_voucher_method_with_its_own_completion_rate() -> None:
+    """Boleto: 55 paid of 55 + 45 resolved is 55%; PIX, an instant transfer, has none."""
+    lf = _measures(
+        [
+            {"payment_method": "boleto", "n_approved": 55, "n_expired": 45},
+            {"payment_method": "pix", "n_approved": 90, "n_declined": 10, "n_expired": 2},
+        ]
+    )
+
+    by_method = performance(lf, ["payment_method"]).collect()
+    boleto, pix = by_method.row(0, named=True), by_method.row(1, named=True)
+
+    assert boleto["voucher_attempts"] == 100
+    assert boleto["completion_rate"] == pytest.approx(0.55)
+    assert pix["completion_rate"] is None
+    assert pix["auth_rate"] == pytest.approx(0.90)
