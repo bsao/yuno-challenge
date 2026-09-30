@@ -14,6 +14,7 @@ from pipeline.quality import (
     check_positive_amounts,
     check_row_count_reconciliation,
     check_status_mix,
+    check_totals_match,
     check_unique,
 )
 
@@ -84,3 +85,19 @@ def test_check_row_count_reconciliation() -> None:
         check_row_count_reconciliation(**{**counts, "events_in_staging": 9})
     with pytest.raises(DataQualityError, match="transaction counts do not reconcile"):
         check_row_count_reconciliation(**{**counts, "staging_rows": 4})
+
+
+def test_check_unique_supports_a_composite_grain() -> None:
+    """A repeated (date, country) pair is reported even when each column repeats on its own."""
+    frame = pl.DataFrame({"date": ["d1", "d1", "d2"], "country": ["MX", "CO", "MX"]})
+    check_unique(frame, ["date", "country"])
+    with pytest.raises(DataQualityError, match="date, country is not unique: 1 duplicated"):
+        check_unique(pl.concat([frame, frame.head(1)]), ["date", "country"])
+
+
+def test_check_totals_match_raises_beyond_the_tolerance() -> None:
+    """Totals must be equal, or within the tolerance for floating point sums."""
+    check_totals_match("rows", 10, 10)
+    check_totals_match("usd", 100.0, 100.004, tolerance=0.01)
+    with pytest.raises(DataQualityError, match="rows does not reconcile: expected=10 actual=9"):
+        check_totals_match("rows", 10, 9)

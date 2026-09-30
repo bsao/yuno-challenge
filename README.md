@@ -44,4 +44,4 @@ make check
 
 ## Status
 
-Generation and ingestion work (`make pipeline` writes `data/staging/transactions.parquet`); transform, the standalone quality stage and the dashboard views are stubs.
+The pipeline runs end to end (`make pipeline` generates, ingests, builds the marts and logs the headline findings); the dashboard views and the anomaly, health and cost analyses are stubs.

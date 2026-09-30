@@ -10,7 +10,7 @@ Assumptions: the checks are generic. Vocabularies and expected ranges are passed
 """
 
 import logging
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Mapping, Sequence
 
 import polars as pl
 
@@ -33,20 +33,39 @@ class DataQualityError(Exception):
     """Raised when a data quality assertion fails."""
 
 
-def check_unique(frame: pl.DataFrame, column: str) -> None:
-    """Assert that ``column`` holds no duplicated value.
+def check_unique(frame: pl.DataFrame, columns: str | Sequence[str]) -> None:
+    """Assert that the key formed by ``columns`` holds no duplicated value.
 
     Args:
         frame: Frame to validate.
-        column: Name of the key column.
+        columns: Name of the key column, or the names forming a composite key (the grain).
 
     Raises:
-        DataQualityError: If at least one value appears more than once.
+        DataQualityError: If at least one key appears more than once.
     """
-    duplicated = frame.height - frame.get_column(column).n_unique()
+    key = [columns] if isinstance(columns, str) else list(columns)
+    name = ", ".join(key)
+    duplicated = frame.height - frame.select(key).n_unique()
     if duplicated:
-        raise DataQualityError(f"{column} is not unique: {duplicated} duplicated rows")
-    logger.info("check=unique column=%s status=passed rows=%d", column, frame.height)
+        raise DataQualityError(f"{name} is not unique: {duplicated} duplicated rows")
+    logger.info("check=unique column=%s status=passed rows=%d", name, frame.height)
+
+
+def check_totals_match(name: str, expected: float, actual: float, tolerance: float = 0.0) -> None:
+    """Assert that a total computed at one grain equals the same total at another grain.
+
+    Args:
+        name: Label of the total, used in the log line and the error message.
+        expected: Total at the source grain.
+        actual: Total at the derived grain.
+        tolerance: Accepted absolute difference, for floating point sums.
+
+    Raises:
+        DataQualityError: If the totals differ by more than ``tolerance``.
+    """
+    if abs(expected - actual) > tolerance:
+        raise DataQualityError(f"{name} does not reconcile: expected={expected} actual={actual}")
+    logger.info("check=totals_match name=%s status=passed value=%s", name, actual)
 
 
 def check_enum_values(

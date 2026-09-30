@@ -114,3 +114,51 @@ reconciliation between raw and staging.
 - **Reconciliation identities**: `raw rows - duplicates == distinct event_id == sum of n_events in
   staging`, and `distinct transaction_id in raw == staging rows`. The raw counts come from a
   separate aggregation of the raw file, independent of the deduplication path.
+
+## D8. Marts: additive measures only
+
+`pipeline/transform.py` writes two marts.
+
+- **`fct_transactions.parquet`**: one row per `transaction_id`. The staging columns plus
+  `local_date`, `merchant_category` and `merchant_size_tier` (many to one join to
+  `merchants.csv`, validated, so the grain cannot fan out).
+- **`agg_daily.parquet`**: one row per `date` x `country` x `psp` x `payment_method`, where `date`
+  is the local creation date. Columns: `n_transactions`, one count per final status
+  (`n_approved`, `n_declined`, `n_failed`, `n_expired`, `n_pending`, `n_refunded`),
+  `approved_amount_usd` and `refunded_amount_usd`.
+- **No rates in the marts.** Rates are not additive: averaging daily authorization rates gives a
+  wrong answer at any coarser grain. The aggregate stores only counts and sums, and
+  `analytics/metrics.py` derives every rate at read time. This also keeps the dependency one way:
+  the pipeline knows statuses, the analytics layer knows what they mean.
+- **Quality assertions**: unique `transaction_id`; fact rows equal staging rows; no transaction
+  without merchant attributes; unique aggregate grain; the aggregate's transaction count, each
+  status count and both USD sums reconcile with the fact table.
+- **Amounts in the aggregate are USD only**, because the aggregate is read across countries.
+  Per currency analysis uses `amount_minor` in the fact table.
+
+## D9. Metric definitions
+
+All formulas live in `analytics/metrics.py`; `performance(lf, dims)` returns them per combination
+of dimensions, computed as Polars expressions over the additive measures.
+
+| Metric | Formula |
+|---|---|
+| `approved` | `n_approved + n_refunded` (a refunded transaction was authorized first) |
+| `attempts` | `approved + n_declined + n_failed` (pending and expired are excluded) |
+| `auth_rate` | `approved / attempts` |
+| `wilson_low`, `wilson_high` | Wilson 95% score interval of `approved` out of `attempts`, z = 1.96 |
+| `gmv_usd` | `approved_amount_usd + refunded_amount_usd` (gross) |
+| `net_gmv_usd` | `gmv_usd - refunded_amount_usd` |
+| `voucher_attempts` | `paid + n_expired` over voucher methods (OXXO) only, `paid = n_approved + n_refunded` |
+| `completion_rate` | `paid / voucher_attempts`, with its own Wilson interval |
+
+- **Sample size next to every rate**: `attempts` for the authorization rate, `voucher_attempts`
+  for the completion rate. A rate with a zero denominator is null, never 0.
+- **Why Wilson**: the normal approximation produces bounds outside [0, 1] and collapses to a zero
+  width interval at 0% or 100%, exactly where small segments mislead. Wilson stays inside [0, 1].
+- **Why vouchers need a second rate**: an OXXO voucher that is never paid expires; it is not
+  declined. Expired is excluded from the authorization rate, so OXXO shows 96.2% authorization
+  while only 60.0% of vouchers are paid. Ranking methods by authorization rate alone would call
+  OXXO the best method in Mexico; the completion rate is the number that matters for it.
+- **Like for like PSP comparison**: PSP_C and PSP_D are live in Colombia for only the last 45 days,
+  so the PSP comparison uses only the days on which every PSP of the segment was live.
