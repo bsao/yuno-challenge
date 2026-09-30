@@ -578,7 +578,7 @@ def render_anomalies(filters: Filters) -> None:
     start, end, countries = filters
     scored = load_anomalies(countries)
     daily = scored["daily"].filter(pl.col("date").is_between(start, end))
-    daily_flags = daily.filter(pl.col("is_anomaly"))
+    daily_flags = daily.filter(pl.col("is_anomaly")).sort("z", descending=True)
     hourly_flags = scored["hourly"].filter(pl.col("local_date").is_between(start, end))
 
     rows: list[dict[str, Any]] = [

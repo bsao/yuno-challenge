@@ -1,91 +1,66 @@
 # Decisions
 
-Design decisions and their trade offs. Metric definitions are in D6, D7, D9 and D10.
+Short architecture decision records. Each states the context, the decision and its consequences.
 
-## D1. Stack and tooling
+## ADR 1. Polars over pandas
 
-Python 3.11; Polars (lazy where it helps) for every transformation; Parquet for staging and marts;
-Streamlit and Plotly for the dashboard; NumPy only for seeded random generation. Top level
-dependencies are pinned to exact versions.
+**Context.** About 2.4 million webhook deliveries and 1.2 million transactions must be
+deduplicated, collapsed and aggregated on a laptop, and the code should read like the SQL a data
+team will port it to.
 
-`mypy --strict` covers `data_gen`, `pipeline` and `analytics`. **The Streamlit app is excluded**:
-Streamlit and Plotly expose loosely typed APIs, so strict mode there would add casts and ignores
-without catching real defects. The app is kept free of metric logic so everything that matters
-stays typed. Ruff, including docstring rules, still applies to the app.
+**Decision.** Polars for every transformation, lazy where it helps. NumPy only for seeded random
+generation.
 
-## D2. Containers
+**Consequences.**
 
-One image, two Compose services sharing the named volume `data` at `/app/data`. `pipeline` runs
-`python -m pipeline.run` and exits; `app` starts only if it completed successfully. Batch and
-serving are separated as they would be in production, and the reviewer still runs one command.
-The container runs as a non root user; the healthcheck is Python because slim images have no curl.
+- The whole pipeline runs in about 7 seconds. Expressions are composable, so one metric
+  definition serves the marts, the detectors and the dashboard.
+- Strict typing works: Polars is typed, unlike most of the pandas API.
+- The dashboard scans Parquet lazily and only ever holds small aggregates.
+- Trade off: ingestion collects the deduplicated events in memory, so the pipeline peaks at about
+  2.4 GB at the default scale. A streaming sink or an incremental merge removes that ceiling.
 
-## D3. Synthetic raw data
+## ADR 2. Parquet layers: raw, staging, marts
 
-`data_gen/generate.py` plays the upstream system and shares no code with the pipeline; the files
-are the only contract.
+**Context.** Webhooks arrive duplicated and out of order; analysts need stable tables.
 
-- **`webhooks.jsonl`**: one row per webhook delivery: one event per status change, plus about 1%
-  repeated deliveries of the same `event_id`. Line order is arrival order, and 3% of events arrive
-  1 minute to 48 hours late, so a `pending` can follow its own final status.
-- **`merchants.csv`** (120 merchants, lognormal volume), **`psp_fees.csv`** (`pct_fee` is percent of
-  the amount, `fixed_fee_usd` per transaction), **`planted_anomalies.json`** (ground truth).
-- **Cards** are one method, `card`, with `card_brand` visa or mastercard.
-- **PSPs**: PSP_A and PSP_B serve every country; PSP_C and PSP_D serve Colombia only, for the last
-  45 days.
-- **Lifecycle**: `pending`, then `approved`, `declined`, `failed` or `expired`; 2% of approved are
-  later `refunded` (full refunds only).
-- **Window**: 90 local days ending on a fixed date, 2026-09-30, so the same seed always gives byte
-  identical files. Status changes after the snapshot (2026-10-01 06:00 UTC) are not emitted, so
-  recent transactions can still be `pending`.
-- **Volume**: 1,200,000 transactions by default (TiendaMax's real 400,000 per month), above the
-  55,000 minimum. The planted night time anomaly covers two hours of one weekend for one PSP: about
-  5 transactions at 55,000, 122 at full scale. Small segments need real volume.
-  `--transactions` shrinks it.
-- **Trade off**: at full scale the pipeline peaks at about 2.4 GB of memory, and so does
-  `make check`, because one test runs the pipeline at full scale. A Docker VM limited to 2 GB is
-  not enough.
+**Decision.** Three layers, each with one grain and quality assertions before it is written.
 
-## D4. Ingestion
+| Layer | File | Grain |
+| --- | --- | --- |
+| Raw | `webhooks.jsonl`, `merchants.csv`, `psp_fees.csv` | one row per webhook delivery |
+| Staging | `transactions.parquet` | one row per transaction, latest status |
+| Mart | `fct_transactions.parquet` | one row per transaction, plus local date and merchant attributes |
+| Mart | `agg_daily.parquet` | local date x country x psp x payment_method |
 
-`pipeline/ingest.py` writes `staging/transactions.parquet`, one row per `transaction_id`.
-
-- **Deduplication**: deliveries sharing an `event_id` are identical retries; the first is kept.
+- **Deduplicate by `event_id`**, keeping the first arrival.
 - **Latest event wins by event time** (`event_at`), never by arrival order. Ties break on the
   lifecycle rank of the status (pending < final < refunded), then `event_id`.
-- **Idempotent by full refresh**: staging is rebuilt from the whole raw file, so replayed or
-  reordered deliveries give the same output (tested; reruns are byte identical). In production
-  this becomes an incremental merge on `transaction_id` with the same ordering rule.
-- **Money**: `amount_minor` stays an integer. `amount_usd = amount_minor / 10 ** exponent * rate`,
-  exponents MXN 2, COP 2, CLP 0, fixed illustrative rates 1 MXN = 0.054, 1 COP = 0.00025,
-  1 CLP = 0.00105 USD. They are not market rates; USD exists so countries can be summed.
-- **Local time**: `created_at` converted with the IANA zone of the country (Chile changes to
-  daylight saving time inside the window). Stored without a zone because one column cannot hold
-  three. Weekday is ISO, 1 Monday to 7 Sunday. Transactions are bucketed by creation time.
-- **Trade off**: deduplicated events are collected in memory. A streaming sink or the incremental
-  merge removes that ceiling.
+- **Idempotent by full refresh**: staging is rebuilt from the whole raw file, so replays and
+  reordering give the same output (tested; reruns are byte identical).
+- **Marts hold only additive measures** (a count per status, approved and refunded USD). Rates are
+  not additive, so they are derived at read time and any rollup stays correct. The pipeline knows
+  statuses; only `analytics` knows what they mean.
+- **Money**: `amount_minor` is an integer. `amount_usd = amount_minor / 10 ** exponent * rate`,
+  exponents MXN 2, BRL 2, COP 2, CLP 0; fixed illustrative rates 1 MXN = 0.054, 1 BRL = 0.18,
+  1 COP = 0.00025, 1 CLP = 0.00105 USD. USD exists only so countries can be summed.
+- **Time**: stored in UTC. Local date, hour and ISO weekday use the IANA zone of the country
+  (Chile changes to daylight saving time inside the window). Transactions are bucketed by
+  creation time.
+- **Assertions** (`pipeline/quality.py`): unique keys; valid vocabularies; positive amounts;
+  status mix inside wide guardrails; `raw rows - duplicates == distinct events == events in
+  staging`; every count and USD sum of the aggregate reconciles with the fact table. A failure
+  stops the pipeline before the file is written.
 
-## D5. Marts and quality assertions
+**Consequences.** A full refresh is simple and provably idempotent, and it does not scale
+indefinitely; the production path is an incremental merge with the same ordering rule.
 
-- **`fct_transactions.parquet`**: one row per transaction; staging plus `local_date` and merchant
-  category and size tier.
-- **`agg_daily.parquet`**: one row per local date x country x psp x payment_method, holding only
-  additive measures: a count per final status and the approved and refunded USD sums.
-- **No rates in the marts.** Rates are not additive, so averaging daily rates is wrong at any
-  coarser grain. The analytics layer derives them from counts at read time. This also keeps the
-  dependency one way: the pipeline knows statuses, analytics knows what they mean.
-- **Assertions** (`pipeline/quality.py`) run before each stage writes, so a failure leaves no
-  partial file. Staging: unique `transaction_id`; valid vocabularies; positive amounts; status mix
-  inside wide guardrails (approved 55% to 90%, declined 8% to 30%, failed 0.5% to 8%, expired up to
-  10%, pending and refunded up to 5%); `raw rows - duplicates == distinct events == sum of events
-  per transaction` and `distinct raw transactions == staging rows`. Marts: unique grains; every
-  count and USD sum of the aggregate reconciles with the fact table.
-- **Gap**: the generator has no runtime assertion of its own; its output is validated by ingest.
+## ADR 3. Metric definitions live in one module
 
-## D6. Metric definitions
+**Context.** A rate computed in three places will disagree in three places.
 
-All formulas live in `analytics/metrics.py`, computed as Polars expressions over the additive
-measures.
+**Decision.** Every formula is in `analytics/metrics.py`, as Polars expressions over the additive
+measures. Each rate is returned with its sample size and Wilson 95% interval.
 
 | Metric | Formula |
 | --- | --- |
@@ -93,22 +68,42 @@ measures.
 | `attempts` | `approved + n_declined + n_failed` (pending and expired excluded) |
 | `auth_rate` | `approved / attempts` |
 | `decline_rate`, `failure_rate` | `n_declined / attempts`, `n_failed / attempts` |
+| `refund_rate` | `n_refunded / approved` |
 | `gmv_usd` | `approved_amount_usd + refunded_amount_usd` (gross) |
 | `net_gmv_usd` | `gmv_usd - refunded_amount_usd` |
-| `completion_rate` | `paid / (paid + expired)`, voucher methods (OXXO) only, `paid = n_approved + n_refunded` |
+| `completion_rate` | `paid / (paid + expired)`, voucher methods (OXXO, Boleto) only |
 | `expiration_rate` | `expired / (paid + expired)`, voucher methods only |
-| Wilson 95% interval | `center = (p + z²/2n) / (1 + z²/n)`, `half = z·sqrt(p(1-p)/n + z²/4n²) / (1 + z²/n)`, z = 1.96 |
+| Wilson interval | `center = (p + z²/2n) / (1 + z²/n)`, `half = z·sqrt(p(1-p)/n + z²/4n²) / (1 + z²/n)`, z = 1.96 |
 
-- Every rate is returned with its sample size and Wilson interval; a zero denominator gives null.
-- **Why Wilson**: the normal approximation leaves [0, 1] and collapses to zero width at 0% or
-  100%, exactly where small segments mislead.
-- **Why vouchers need their own rate**: an unpaid voucher expires, it is not declined, so OXXO
-  shows 96.2% authorization while only 60.0% of vouchers are paid.
+**Consequences.**
 
-## D7. Anomaly detection
+- Wilson, not the normal approximation: it stays inside [0, 1] and does not collapse at 0% or
+  100%, exactly where small segments mislead. A zero denominator gives null, never 0.
+- Vouchers need their own rate: an unpaid voucher expires, it is not declined, so OXXO and Boleto
+  show about 96% authorization while about 60% of vouchers are paid.
+- Two models sit outside this module, each documented where it lives. The **health score**
+  (`analytics/health.py`): authorization against peers 40%, technical failures 20%, refunds 15%,
+  30 day volume trend 25%, each mapped linearly between a bad and a good anchor; below 50 is
+  `at_risk`. The **fee model** (`analytics/cost.py`): percentage fee on successful volume plus the
+  fixed fee on every attempt, divided by successful transactions.
 
-`analytics/anomalies.py`.
-`z = (rate - baseline) / sqrt(baseline · (1 - baseline) / attempts)`.
+## ADR 4. mypy strict scope
+
+**Context.** Full type hints are required; Streamlit and Plotly expose loosely typed APIs.
+
+**Decision.** `mypy --strict` covers `data_gen`, `pipeline` and `analytics`. The Streamlit app is
+excluded.
+
+**Consequences.** Strict mode in the app would add casts and ignores without catching real
+defects. To keep the exclusion safe the app holds no metric logic: it filters, caches and draws,
+and every number comes from typed code. Ruff, including the docstring rules, still covers the app.
+
+## ADR 5. Anomaly method
+
+**Context.** The data team needs flags it can explain to a PSP, not a black box.
+
+**Decision.** Binomial z scores against a pooled trailing baseline, and a Wilson bound against
+peers. `z = (rate - baseline) / sqrt(baseline · (1 - baseline) / attempts)`.
 
 | Detector | Grain | Baseline | Flag when |
 | --- | --- | --- | --- |
@@ -116,70 +111,41 @@ measures.
 | Hourly reason rate | psp x country x local date x hour x reason | pooled previous 14 days, all hours | z >= 5, attempts >= 20, events >= 10 |
 | Merchant against peers | merchant x metric (authorization, completion) | other merchants of the same country and category | attempts >= 50 and Wilson upper bound more than 10 points below peers |
 
-- **Why an hourly detector**: a two hour outage barely moves a daily rate.
-- **Why z >= 5 for it**: it scores about 53,000 combinations. At z >= 3 it raised 63 flags, 59 by
-  chance; at z >= 5 only the planted window remains.
-- **Pooled baseline**, not a mean of daily rates, so a low volume day cannot distort it.
-- **Baselines include earlier anomalous days**, so z decays during a multi day incident (8.0, 6.9,
-  5.7). Conservative; excluding flagged days is the production refinement.
-- **Peers leave the merchant out.** A merchant alone in its group falls back to country peers.
-- **Limitations**: merchant authorization is not adjusted for method mix; segments are assumed to
-  trade every day, so 14 rows are 14 days.
+**Consequences.**
 
-## D8. Dashboard
+- All three planted anomalies are detected, and the planted days are the strongest flags.
+- **The daily rule is noisy at z >= 3**: on 1,492 scored rows it raises 13 flags, 3 planted
+  (z 5.4 to 8.6) and 10 isolated (z 3.0 to 4.3). Low rates on small samples are skewed, so the
+  normal approximation overstates z. Raising the threshold to 5 would leave only the incident.
+- The hourly rule exists because a two hour outage barely moves a daily rate. It uses z >= 5
+  because it scores about 59,000 combinations.
+- Pooled baselines weight days by volume. They include earlier anomalous days, so z decays during
+  a multi day incident; excluding flagged days is the production refinement.
+- Limits: no seasonality model, and merchant authorization is not adjusted for method mix.
 
-- **No metric logic in the app**: it filters, caches and draws; numbers come from `analytics`.
-- **Caching**: each `st.cache_data` function scans Parquet lazily and returns a small aggregate
-  keyed by the filters, so the fact table is never held in the session.
-- **Anomalies are scored on the whole window** (detectors need 14 days of history); the date
-  filter only selects which flags are shown.
-- **Each chart has a caption naming the decision it supports.** No dual axes; one hue for
-  heatmaps; a PSP keeps its colour under any filter; red is reserved for anomalies. The palette
-  was checked for colour vision deficiency; the light theme is pinned because it was validated
-  there.
-- **Merchant rankings need 200 attempts**, so tiny merchants cannot top a list.
-- **Gaps**: the hour by weekday heatmap and the OXXO by merchant chart show the sample size but no
-  interval. USD is shown in every view, including single country ones, because the aggregate
-  stores USD only.
+## ADR 6. Synthetic data at real scale
 
-## D9. Merchant health score
+**Context.** No real data; the analysis must still be checkable.
 
-`analytics/health.py` scores each merchant from 0 to 100; below 50 is `at_risk`. The score is a
-weighted sum of four components, each mapped linearly from a bad anchor (0) to a good anchor (100)
-and clipped.
+**Decision.** A seeded generator that shares no code with the pipeline. It writes a fixed 90 day
+window ending 2026-09-30, at TiendaMax's real volume (1,200,000 transactions), with about 1%
+duplicated and 3% late deliveries, and three planted anomalies recorded in
+`planted_anomalies.json`.
 
-| Component | Weight | Input | Bad (0) | Good (100) |
-| --- | --- | --- | --- | --- |
-| Authorization | 40% | `auth_rate` minus the rate of country and category peers | -10 points | +5 points |
-| Failure | 20% | `failure_rate` (technical failures / attempts) | 10% | 0% |
-| Refund | 15% | `refund_rate = n_refunded / approved` | 10% | 0% |
-| Volume | 25% | transactions last 30 days / previous 30 days - 1 | -50% | +25% |
+**Consequences.**
 
-- **Why these weights**: authorization is what the merchant loses sales on, so it weighs most; a
-  volume drop is the strongest sign a merchant is leaving; failures and refunds are secondary.
-- **Main driver** is the component costing the most points, `weight * (100 - component score)`,
-  so the list says what to talk about, not only whom to call.
-- **An undefined input scores a neutral 50**, so a new merchant is neither rewarded nor punished.
-- **Calibration**: an average merchant (at its peers, 3% failures, 2% refunds, flat volume) scores
-  69. A merchant must be clearly worse on the heavy components to fall below 50.
-- **Limitations**: the voucher completion rate is not a component, so the merchant with the broken
-  OXXO flow scores healthy here and is caught by the peer detector (D7) instead. Authorization is
-  not adjusted for method mix. Small merchants have noisy components.
+- Same seed, byte identical files, so every number in the docs is reproducible.
+- Ground truth makes the detectors testable.
+- Full scale is needed: the planted night outage covers about 94 attempts; at the 55,000 minimum
+  it would cover about 4. The cost is memory (ADR 1); `--transactions` shrinks the dataset.
+- Payment methods: cards everywhere; OXXO and SPEI in Mexico; PIX and Boleto in Brazil; PSE in
+  Colombia; Webpay in Chile. PSP_C and PSP_D serve Colombia only, for the last 45 days.
 
-## D10. PSP cost
+## ADR 7. Two containers, one command
 
-`analytics/cost.py`, per psp x country x payment_method, from `psp_fees.csv`.
+**Decision.** One image, two Compose services sharing a volume. `pipeline` runs and exits; `app`
+starts only if it succeeded. The container runs as a non root user and its healthcheck is Python,
+because slim images have no curl.
 
-- **Fee model (assumption)**: the percentage fee is charged on successful volume and is not
-  returned on a refund; the fixed fee is charged on every attempt. So
-  `total_fees = pct_fee / 100 * gmv_usd + fixed_fee_usd * attempts` and
-  `cost_per_success = total_fees / approved`. A PSP that fails more pays its fixed fee more often
-  per sale.
-- **Simulation**: move 20% of the worst PSP's attempts to the best PSP of the segment, holding
-  observed authorization rates; moved traffic keeps the average ticket of the PSP it leaves;
-  results are scaled to 30 days. `monthly_savings = fees_before - fees_after` on the moved traffic.
-- **Like for like**: only the days on which every PSP of the segment was live.
-- **Savings are fees only, and the approved GMV delta is always reported next to them.** Ranked by
-  cost, the cheapest PSP per sale is usually the one that approves less, so saving fees loses
-  sales. The simulation can also rank by authorization rate, which shows the opposite trade.
-- **Limitation**: no margin is assumed, so fees and GMV are not netted into one number.
+**Consequences.** Batch and serving are separated as in production, and a reviewer still runs one
+command.

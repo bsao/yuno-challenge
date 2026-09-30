@@ -51,6 +51,11 @@ def interval(row: dict[str, Any], prefix: str = "wilson") -> str:
     return f"{pct(row[f'{prefix}_low'])} to {pct(row[f'{prefix}_high'])}"
 
 
+def method_label(name: str) -> str:
+    """Format a payment method name for prose (OXXO is an acronym)."""
+    return name.upper() if name in {"oxxo", "pix", "pse", "spei"} else name.capitalize()
+
+
 def table(header: list[str], rows: list[list[str]]) -> str:
     """Render a Markdown table."""
     lines = ["| " + " | ".join(header) + " |", "| " + " | ".join("---" for _ in header) + " |"]
@@ -61,7 +66,9 @@ def table(header: list[str], rows: list[list[str]]) -> str:
 def build() -> str:
     """Compute every figure and return the memo as Markdown."""
     days = AGG.select(pl.col("date").n_unique()).collect().item()
-    first, last = AGG.select(pl.col("date").min(), pl.col("date").max().alias("last")).collect().row(0)
+    first, last = (
+        AGG.select(pl.col("date").min(), pl.col("date").max().alias("last")).collect().row(0)
+    )
     monthly = DAYS_PER_MONTH / days
     transactions = FCT.select(pl.len()).collect().item()
     merchants = FCT.select(pl.col("merchant_id").n_unique()).collect().item()
@@ -70,10 +77,14 @@ def build() -> str:
     # 1. Payment methods.
     by_country = performance(AGG, ["country"]).sort("net_gmv_usd", descending=True).collect()
     by_method = performance(AGG, ["country", "payment_method"]).collect()
-    card = performance(AGG.filter(pl.col("payment_method") == "card"), []).collect().row(0, named=True)
-    other = performance(
-        AGG.filter(~pl.col("payment_method").is_in(["card", *VOUCHER_METHODS])), []
-    ).collect().row(0, named=True)
+    card = (
+        performance(AGG.filter(pl.col("payment_method") == "card"), []).collect().row(0, named=True)
+    )
+    other = (
+        performance(AGG.filter(~pl.col("payment_method").is_in(["card", *VOUCHER_METHODS])), [])
+        .collect()
+        .row(0, named=True)
+    )
     assert other["auth_rate"] > card["auth_rate"], "bank transfers no longer beat cards"
     method_rows = []
     for country in by_country.get_column("country"):
@@ -98,7 +109,9 @@ def build() -> str:
     card_point_usd = card["attempts"] * 0.01 * card["gmv_usd"] / card["approved"] * monthly
 
     # 2. Vouchers.
-    vouchers = performance(AGG.filter(pl.col("payment_method").is_in(VOUCHER_METHODS)), []).collect()
+    vouchers = performance(
+        AGG.filter(pl.col("payment_method").is_in(VOUCHER_METHODS)), []
+    ).collect()
     voucher = vouchers.row(0, named=True)
     expired_usd = (
         FCT.filter(
@@ -123,7 +136,9 @@ def build() -> str:
     best_psp, worst_psp = co_card.row(0, named=True), co_card.row(-1, named=True)
     runner_up = co_card.row(1, named=True)
     assert best_psp["wilson_low"] > runner_up["wilson_high"], "best Colombian PSP is not distinct"
-    assert worst_psp["wilson_high"] < co_card.row(-2, named=True)["wilson_low"], "worst not distinct"
+    assert worst_psp["wilson_high"] < co_card.row(-2, named=True)["wilson_low"], (
+        "worst not distinct"
+    )
     assert worst_psp["cost_per_success_usd"] == co_card.get_column("cost_per_success_usd").min()
     psp_rows = [
         [
@@ -161,7 +176,9 @@ def build() -> str:
     rate_gain = by_rate.get_column("monthly_gmv_delta_usd").sum()
     rate_fees = -by_rate.get_column("monthly_savings_usd").sum()
     by_cost = shifts["cost_per_success_usd"]
-    assert rate_gain > 0 and by_cost.get_column("monthly_gmv_delta_usd").sum() < 0
+    cost_loss = -by_cost.get_column("monthly_gmv_delta_usd").sum()
+    assert rate_gain > 0, "routing by approval rate no longer gains sales"
+    assert cost_loss > 3 * by_cost.get_column("monthly_savings_usd").sum(), "cost routing claim"
 
     # 5. Discovered issues.
     daily = anomalies.score_daily_decline_rate(AGG).filter(pl.col("is_anomaly")).collect()
@@ -200,7 +217,8 @@ def build() -> str:
     assert outage_key.height == 1, "hourly flags no longer describe a single outage"
     outage_psp, outage_country, outage_reason = outage_key.row(0)
     excess_failures = (
-        outage.get_column("events") - outage.get_column("attempts") * outage.get_column("baseline_rate")
+        outage.get_column("events")
+        - outage.get_column("attempts") * outage.get_column("baseline_rate")
     ).sum()
 
     peers = anomalies.score_merchants_against_peers(FCT).filter(pl.col("is_anomaly")).collect()
@@ -237,7 +255,49 @@ def build() -> str:
         ]
         for row in by_country.iter_rows(named=True)
     ]
-    voucher_names = " and ".join(name.upper() if name == "oxxo" else name.capitalize() for name in VOUCHER_METHODS)
+    voucher_names = " and ".join(method_label(name) for name in VOUCHER_METHODS)
+    incident_dates = incident.get_column("date")
+    incident_rows = [
+        [
+            f"Decline spike at {incident_key[0]}, {COUNTRY_NAMES[incident_key[1]]} "
+            f"{incident_key[2]}s, {incident_dates.min()} to {incident_dates.max()}",
+            f"Decline rate {pct(incident.get_column('decline_rate').min())} to "
+            f"{pct(incident.get_column('decline_rate').max())} against about "
+            f"{pct(incident.get_column('baseline_rate').min())} normally",
+            f"About {excess_declines:,.0f} extra declines, "
+            f"{usd(excess_declines * incident_ticket)} of sales",
+        ],
+        [
+            f"Night outage at {outage_psp}, {COUNTRY_NAMES[outage_country]}, "
+            f"{outage.get_column('local_date').min()} and {outage.get_column('local_date').max()}, "
+            f"{outage.get_column('local_hour').min():02d}:00 to "
+            f"{outage.get_column('local_hour').max() + 1:02d}:00",
+            f"{pct(outage.get_column('rate').min(), 0)} to "
+            f"{pct(outage.get_column('rate').max(), 0)} "
+            f"of attempts ended in {outage_reason} against "
+            f"{pct(outage.get_column('baseline_rate').min())} normally",
+            f"About {excess_failures:,.0f} failed payments; small in money, but a full outage "
+            f"nobody saw",
+        ],
+        [
+            f"Broken {method_label(broken_method)} flow at merchant {broken['merchant_id']}",
+            f"{pct(broken['rate'])} of {broken['attempts']:,} vouchers paid against "
+            f"{pct(broken['peer_rate'])} at similar merchants",
+            f"About {usd(recoverable)} a month recoverable at the peer rate",
+        ],
+    ]
+    method_table = table(
+        ["Country", "Method", "Approval rate", "95% interval", "Attempts", "Vouchers paid"],
+        method_rows,
+    )
+    psp_table = table(
+        ["PSP", "Method", "Approval rate", "95% interval", "Attempts", "Fee", "Cost per sale"],
+        psp_rows,
+    )
+    shift_table = table(
+        ["Best PSP defined as", "Fees saved / month", "Approved payments / month", "GMV / month"],
+        shift_rows,
+    )
 
     return f"""# Payment performance: findings and recommendations
 
@@ -264,7 +324,7 @@ Monthly figures are the period scaled to 30 days. Ranges are 95% confidence inte
 
 {table(["Country", "Approval rate", "Attempts", "Net GMV / month"], country_rows)}
 
-{table(["Country", "Method", "Approval rate", "95% interval", "Attempts", "Vouchers paid"], method_rows)}
+{method_table}
 
 - Bank transfers beat cards in every country. Cards carry most of the volume, so they are where
   improvement pays.
@@ -279,7 +339,7 @@ reminders for open vouchers before they expire.
 
 Compared on the same days, from {since}, when all four PSPs were live.
 
-{table(["PSP", "Method", "Approval rate", "95% interval", "Attempts", "Fee", "Cost per sale"], psp_rows)}
+{psp_table}
 
 - **{best_psp["psp"]}** approves the most on cards ({pct(best_psp["auth_rate"])}) and its interval
   does not overlap any other PSP. It is also the most expensive per sale
@@ -295,7 +355,7 @@ renegotiate it as a fallback only.
 Simulation: move 20% of the worst PSP's traffic to the best PSP in each country and method, at the
 approval rates observed.
 
-{table(["Best PSP defined as", "Fees saved / month", "Approved payments / month", "Approved GMV / month"], shift_rows)}
+{shift_table}
 
 **Recommendation**: route on approval rate. It costs about {usd(rate_fees)} a month in fees and
 adds about {usd(rate_gain)} a month in approved sales. Use the cost per sale to negotiate fees, not
@@ -303,15 +363,11 @@ to route.
 
 ## 4. Incidents found by monitoring
 
-| Issue | Evidence | Estimated impact |
-| --- | --- | --- |
-| Decline spike at {incident_key[0]}, {COUNTRY_NAMES[incident_key[1]]} {incident_key[2]}s, {incident.get_column("date").min()} to {incident.get_column("date").max()} | Decline rate {pct(incident.get_column("decline_rate").min())} to {pct(incident.get_column("decline_rate").max())} against about {pct(incident.get_column("baseline_rate").min())} normally | About {excess_declines:,.0f} extra declines, {usd(excess_declines * incident_ticket)} of sales |
-| Night outage at {outage_psp}, {COUNTRY_NAMES[outage_country]}, {outage.get_column("local_date").min()} and {outage.get_column("local_date").max()}, {outage.get_column("local_hour").min():02d}:00 to {outage.get_column("local_hour").max() + 1:02d}:00 | {pct(outage.get_column("rate").min(), 0)} to {pct(outage.get_column("rate").max(), 0)} of attempts ended in {outage_reason} against {pct(outage.get_column("baseline_rate").min())} normally | About {excess_failures:,.0f} failed payments; small in money, but a full outage nobody saw |
-| Broken {broken_method.upper() if broken_method == "oxxo" else broken_method.capitalize()} flow at merchant {broken["merchant_id"]} | {pct(broken["rate"])} of {broken["attempts"]:,} vouchers paid against {pct(broken["peer_rate"])} at similar merchants | About {usd(recoverable)} a month recoverable at the peer rate |
+{table(["Issue", "Evidence", "Estimated impact"], incident_rows)}
 
 - The daily rule also raised {isolated} isolated one day flags (strongest z = {isolated_max_z:.1f}
   against {incident.get_column("z").min():.1f} to {incident.get_column("z").max():.1f} for the
-  incident). At its threshold a few such flags are expected by chance; none repeated.
+  incident). At that threshold a few such flags are expected by chance.
 - Most failures are refusals, not outages: {top_reason["decline_reason"]} alone is
   {pct(top_reason["share"])} of declined and failed payments. Ticket size does not matter (decline
   rate {pct(by_bucket.min())} to {pct(by_bucket.max())} across ticket sizes).

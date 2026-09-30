@@ -1,7 +1,7 @@
 PYTHON ?= python
 COMPOSE ?= docker compose
 
-.PHONY: install data pipeline test lint typecheck check app up down
+.PHONY: install data pipeline test lint typecheck check app analysis up down
 
 install:
 	$(PYTHON) -m pip install -r requirements.txt -r requirements-dev.txt
@@ -35,3 +35,6 @@ up:
 
 down:
 	$(COMPOSE) down
+
+analysis:
+	PYTHONPATH=. $(PYTHON) docs/build_analysis.py
