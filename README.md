@@ -1,8 +1,8 @@
 # TiendaMax Payment Intelligence
 
-Analytics prototype for TiendaMax built on raw Yuno transaction webhooks. It answers which payment
-methods perform well per country, whether the two new Colombian PSPs are worth keeping, whether
-merchant conversion drops are UX or processing issues, and which failure patterns exist.
+Analytics prototype for TiendaMax on raw Yuno transaction webhooks: a seeded synthetic dataset, a
+Polars pipeline to Parquet, tested metric definitions with Wilson intervals, anomaly detection and
+a Streamlit dashboard.
 
 ## Run it
 
@@ -10,8 +10,9 @@ merchant conversion drops are UX or processing issues, and which failure pattern
 docker compose up --build
 ```
 
-Then open <http://localhost:8501>. The `pipeline` service builds the data and exits; the `app`
-service starts the dashboard once the pipeline has completed successfully.
+Then open <http://localhost:8501>. The `pipeline` service generates the data, builds the marts and
+exits; the `app` service starts once it has completed. Give Docker at least 4 GB of memory: the
+default dataset is 1.2 million transactions and the pipeline peaks at about 2.4 GB.
 
 ## Develop locally
 
@@ -24,28 +25,32 @@ make check
 | Target | What it does |
 | --- | --- |
 | `make install` | Install runtime and development dependencies |
-| `make data` | Generate the synthetic raw webhooks |
-| `make pipeline` | Run generate (if needed), ingest, transform and quality checks |
-| `make test` | Run pytest |
-| `make lint` | Run ruff check |
-| `make typecheck` | Run mypy in strict mode |
+| `make data` | Generate the synthetic raw files |
+| `make pipeline` | Generate if raw data is missing, ingest, build marts, log the headline findings |
+| `make test` / `make lint` / `make typecheck` | pytest / ruff check / mypy strict |
 | `make check` | Format check, lint, mypy and pytest, in that order |
-| `make app` | Run the Streamlit dashboard locally |
+| `make app` | Run the dashboard locally (needs `make pipeline` first) |
 | `make up` / `make down` | Start or stop the Docker Compose stack |
 
 ## Layout
 
 - `data_gen/`: synthetic webhook generator
-- `pipeline/`: ingest (raw to staging), transform (staging to marts), quality, run (orchestrator)
-- `analytics/`: metrics, anomalies, merchant health, PSP cost
+- `pipeline/`: `ingest` (raw to staging), `transform` (staging to marts), `quality`, `run`
+- `analytics/`: `metrics` (all definitions), `anomalies`; `health` and `cost` are not implemented
 - `app/`: Streamlit dashboard
-- `docs/`: [WORKLOG.md](docs/WORKLOG.md) (step by step build trail), [DECISIONS.md](docs/DECISIONS.md), [ANALYSIS.md](docs/ANALYSIS.md), screenshots
 - `data/`: generated at run time, not versioned (`raw/`, `staging/`, `marts/`)
+
+## Documentation
+
+- [docs/ANALYSIS.md](docs/ANALYSIS.md): answers to the four business questions, with numbers
+- [docs/DECISIONS.md](docs/DECISIONS.md): design decisions, metric definitions, trade offs
+- [docs/WORKLOG.md](docs/WORKLOG.md): build steps, independent checks, validation, open items
 
 ## Status
 
-The pipeline runs end to end and the dashboard has four working tabs (Overview, Performance,
-Failures, Anomalies). Merchant Health and Cost are placeholders.
+Working: generation, ingestion, marts, metrics, failure analysis, anomaly detection, and the
+Overview, Performance, Failures and Anomalies tabs. Not implemented: merchant health (UX versus
+processing) and PSP cost; their tabs are placeholders.
 
 ## Screenshots
 
