@@ -1,34 +1,41 @@
 """Synthetic webhook generator and CLI entry point.
 
-Purpose: produce deterministic, realistic Yuno transaction webhook deliveries for TiendaMax,
-    including duplicated and late (out of order) deliveries and a set of planted patterns that
-    the analytics layer is expected to recover.
-Inputs: a ``GeneratorConfig`` (seed, scale, window, output directory), usually from the CLI.
-Outputs:
-    ``<output_dir>/events/received_date=YYYY-MM-DD/events.jsonl``: one JSON object per webhook
-        delivery (grain: one row per delivery, so an ``event_id`` can repeat), sorted by arrival.
-    ``<output_dir>/_manifest.json``: ground truth counts and the planted patterns, used to
-        reconcile downstream stages.
+Purpose: produce deterministic, realistic Yuno transaction webhooks for TiendaMax, with duplicated
+    and out of order events and three planted anomalies the analytics layer must recover.
+Inputs: a ``GeneratorConfig`` (seed, transaction count, window, output directory), usually from
+    the CLI.
+Outputs (all under ``config.output_dir``, by default ``data/raw``):
+    ``webhooks.jsonl``: grain is one row per webhook delivery, which is one event per status
+        change plus about 1% repeated deliveries of the same ``event_id``. Line order is arrival
+        order, so some events appear after a later event of the same transaction.
+    ``merchants.csv``: one row per merchant (``merchant_id``, ``country``, ``category``,
+        ``size_tier``).
+    ``psp_fees.csv``: one row per PSP, country and payment method (``pct_fee`` in percent of the
+        amount, ``fixed_fee_usd`` per transaction).
+    ``planted_anomalies.json``: ground truth of the planted anomalies.
 
 Assumptions:
-    * The dataset is a snapshot taken at the end of the window: deliveries that would arrive after
-      it are dropped, so recent transactions can legitimately still be ``pending``.
+    * The window is the 90 local days ending on ``config.end_date``. The default end date is
+      fixed (2026-09-30) so that the same seed always yields byte identical files.
+    * The files are a snapshot taken at ``end_date + 1 day`` 06:00 UTC (local midnight in the
+      westernmost country). Status changes after the snapshot are not emitted, so recent
+      transactions can still be ``pending``.
     * Every event carries the full transaction attributes; they never change between events.
-    * Refunds are always full refunds.
-    * Local time uses fixed UTC offsets that are valid for the default window (June to August).
-    * PSP names are fictional. The generator shares no code with the pipeline on purpose: it
-      plays the role of the upstream system and the JSON contract is the only interface.
+    * Refunds are always full refunds. Each merchant operates in one country.
+    * Cards are one payment method (``card``) with ``card_brand`` visa or mastercard.
+    * The generator shares no code with the pipeline on purpose: it plays the upstream system and
+      the file contract is the only interface.
 """
 
 import argparse
 import json
 import logging
-import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import numpy.typing as npt
@@ -40,108 +47,144 @@ IntArray = npt.NDArray[np.int64]
 FloatArray = npt.NDArray[np.float64]
 BoolArray = npt.NDArray[np.bool_]
 
-TRANSACTIONS_PER_MONTH = 400_000
-MERCHANT_COUNT = 15_000
+WEBHOOKS_FILE = "webhooks.jsonl"
+MERCHANTS_FILE = "merchants.csv"
+PSP_FEES_FILE = "psp_fees.csv"
+PLANTED_ANOMALIES_FILE = "planted_anomalies.json"
+RAW_FILES: tuple[str, ...] = (WEBHOOKS_FILE, MERCHANTS_FILE, PSP_FEES_FILE, PLANTED_ANOMALIES_FILE)
+
+MERCHANT_COUNT = 120
+MERCHANT_VOLUME_SIGMA = 1.4
+MERCHANT_CATEGORIES: tuple[str, ...] = (
+    "fashion",
+    "electronics",
+    "grocery",
+    "home",
+    "beauty",
+    "travel",
+)
+# Size tiers by volume rank: the first 10 merchants, the next 30, then everyone else.
+SIZE_TIERS: tuple[tuple[str, int], ...] = (
+    ("enterprise", 10),
+    ("mid", 40),
+    ("small", MERCHANT_COUNT),
+)
 
 COUNTRIES: tuple[str, ...] = ("MX", "CO", "CL")
 COUNTRY_MERCHANT_SHARE: tuple[float, ...] = (0.5, 0.3, 0.2)
 CURRENCIES: tuple[str, ...] = ("MXN", "COP", "CLP")
-UTC_OFFSET_HOURS: tuple[int, ...] = (-6, -5, -4)
+TIME_ZONES: tuple[str, ...] = ("America/Mexico_City", "America/Bogota", "America/Santiago")
 MEDIAN_AMOUNT_MAJOR: tuple[float, ...] = (600.0, 120_000.0, 25_000.0)
 # Minor units per major unit. COP tickets are whole pesos expressed in centavos; CLP has none.
 MINOR_PER_MAJOR: tuple[int, ...] = (100, 100, 1)
 AMOUNT_SIGMA = 0.8
 
-METHODS: tuple[str, ...] = ("card", "oxxo", "spei", "pse", "nequi", "webpay", "khipu")
+METHODS: tuple[str, ...] = ("card", "oxxo", "spei", "pse", "webpay")
+CARD_METHOD = "card"
 VOUCHER_METHOD = "oxxo"
 # Per country: (method, share of that country's transactions).
 METHOD_MIX: dict[str, tuple[tuple[str, float], ...]] = {
-    "MX": (("card", 0.55), ("oxxo", 0.25), ("spei", 0.20)),
-    "CO": (("card", 0.45), ("pse", 0.35), ("nequi", 0.20)),
-    "CL": (("card", 0.60), ("webpay", 0.30), ("khipu", 0.10)),
+    "MX": (("card", 0.70), ("oxxo", 0.12), ("spei", 0.18)),
+    "CO": (("card", 0.65), ("pse", 0.35)),
+    "CL": (("card", 0.70), ("webpay", 0.30)),
 }
+CARD_BRANDS: tuple[str, ...] = ("visa", "mastercard")
+CARD_BRAND_SHARE: tuple[float, ...] = (0.6, 0.4)
 
-PSPS: tuple[str, ...] = (
-    "psp_azteca",
-    "psp_norte",
-    "psp_andes",
-    "psp_cafetal",
-    "psp_magdalena",
-    "psp_pacifico",
-    "psp_austral",
-)
-PSP_MIX: dict[str, tuple[tuple[str, float], ...]] = {
-    "MX": (("psp_azteca", 0.6), ("psp_norte", 0.4)),
-    "CO": (("psp_andes", 1.0),),
-    "CL": (("psp_pacifico", 0.7), ("psp_austral", 0.3)),
-}
-# Colombia after the two new PSPs go live.
+PSPS: tuple[str, ...] = ("PSP_A", "PSP_B", "PSP_C", "PSP_D")
+PSP_MIX: tuple[tuple[str, float], ...] = (("PSP_A", 0.55), ("PSP_B", 0.45))
+# Colombia once PSP_C and PSP_D go live (they serve no other country).
+NEW_PSPS: tuple[str, ...] = ("PSP_C", "PSP_D")
+NEW_PSP_COUNTRY = "CO"
+NEW_PSP_LIVE_DAYS = 45
 CO_PSP_MIX_AFTER_LAUNCH: tuple[tuple[str, float], ...] = (
-    ("psp_andes", 0.6),
-    ("psp_cafetal", 0.2),
-    ("psp_magdalena", 0.2),
+    ("PSP_A", 0.40),
+    ("PSP_B", 0.30),
+    ("PSP_C", 0.15),
+    ("PSP_D", 0.15),
 )
-CO_NEW_PSP_LAUNCH_DAY = 45
-
-CARD_BRANDS: tuple[str, ...] = ("visa", "mastercard", "amex")
-CARD_BRAND_SHARE: tuple[float, ...] = (0.55, 0.35, 0.10)
-CHANNELS: tuple[str, ...] = ("web", "mobile_web", "app")
-CHANNEL_SHARE: tuple[float, ...] = (0.45, 0.35, 0.20)
+# Fee schedule: percent of the amount per PSP plus a per method adjustment, and a fixed USD fee.
+PSP_PCT_FEE: dict[str, float] = {"PSP_A": 2.9, "PSP_B": 2.6, "PSP_C": 3.2, "PSP_D": 2.2}
+PSP_FIXED_FEE_USD: dict[str, float] = {"PSP_A": 0.10, "PSP_B": 0.12, "PSP_C": 0.08, "PSP_D": 0.05}
+METHOD_PCT_FEE_ADJUSTMENT: dict[str, float] = {
+    "card": 0.0,
+    "oxxo": 0.6,
+    "spei": -1.6,
+    "pse": -1.2,
+    "webpay": -0.8,
+}
 
 STATUSES: tuple[str, ...] = ("approved", "declined", "failed", "expired", "pending", "refunded")
 APPROVED, DECLINED, FAILED, EXPIRED, PENDING, REFUNDED = range(6)
 # Per method: probability of (approved, declined, failed, expired, pending) before modifiers.
 BASE_OUTCOME: dict[str, tuple[float, float, float, float, float]] = {
-    "card": (0.80, 0.14, 0.02, 0.03, 0.01),
-    "oxxo": (0.64, 0.00, 0.005, 0.335, 0.02),
-    "spei": (0.90, 0.03, 0.02, 0.04, 0.01),
-    "pse": (0.82, 0.08, 0.04, 0.05, 0.01),
-    "nequi": (0.86, 0.07, 0.03, 0.03, 0.01),
-    "webpay": (0.88, 0.06, 0.02, 0.03, 0.01),
-    "khipu": (0.84, 0.06, 0.04, 0.05, 0.01),
+    "card": (0.760, 0.195, 0.030, 0.010, 0.005),
+    "oxxo": (0.620, 0.000, 0.010, 0.350, 0.020),
+    "spei": (0.880, 0.060, 0.030, 0.020, 0.010),
+    "pse": (0.800, 0.130, 0.040, 0.020, 0.010),
+    "webpay": (0.840, 0.115, 0.030, 0.010, 0.005),
 }
-REFUND_SHARE_OF_APPROVED = 0.03
+REFUND_SHARE_OF_APPROVED = 0.02
+# Segment effects on authorization (probability mass moved between approved and declined).
+CO_CARD_DECLINE_SHIFT = 0.04
+CL_CARD_APPROVAL_SHIFT = 0.04
+MASTERCARD_DECLINE_SHIFT = 0.02
+PSP_B_DECLINE_SHIFT = 0.03
+PSP_B_CL_APPROVAL_SHIFT = 0.06
+PSP_C_APPROVAL_SHIFT = 0.05
+PSP_D_DECLINE_SHIFT = 0.04
+PSP_D_FAILURE_SHIFT = 0.03
 
-DECLINE_CODES: tuple[str, ...] = (
+REASONS: tuple[str, ...] = (
     "insufficient_funds",
-    "do_not_honor",
+    "card_declined",
     "fraud_suspected",
-    "invalid_data",
-    "limit_exceeded",
+    "expired",
+    "processor_error",
+    "network_timeout",
 )
-DECLINE_CODE_SHARE: tuple[float, ...] = (0.40, 0.25, 0.15, 0.10, 0.10)
-FAILURE_CODES: tuple[str, ...] = ("psp_timeout", "psp_unavailable", "network_error")
-FAILURE_CODE_SHARE: tuple[float, ...] = (0.60, 0.25, 0.15)
-ERROR_CODES: tuple[str, ...] = DECLINE_CODES + FAILURE_CODES
+# Reason mixes as (reason, share). Non card methods cannot be "card_declined".
+CARD_DECLINE_REASONS: tuple[tuple[str, float], ...] = (
+    ("insufficient_funds", 0.45),
+    ("card_declined", 0.35),
+    ("fraud_suspected", 0.20),
+)
+OTHER_DECLINE_REASONS: tuple[tuple[str, float], ...] = (
+    ("insufficient_funds", 0.70),
+    ("fraud_suspected", 0.30),
+)
+FAILURE_REASONS: tuple[tuple[str, float], ...] = (
+    ("processor_error", 0.6),
+    ("network_timeout", 0.4),
+)
 
-# Relative transaction volume per local hour of day (index 0 is midnight).
+# Relative volume per local hour of day (index 0 is midnight) and per weekday (index 0 is Monday).
 HOUR_WEIGHTS: tuple[float, ...] = (
-    1.0, 0.6, 0.4, 0.3, 0.3, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 5.5,
+    1.2, 0.9, 0.8, 0.7, 0.6, 0.7, 1.0, 2.0, 3.0, 4.0, 5.0, 5.5,
     6.0, 6.0, 5.5, 5.0, 5.0, 5.5, 6.0, 7.0, 7.5, 7.0, 5.0, 2.5,
 )  # fmt: skip
+WEEKDAY_WEIGHTS: tuple[float, ...] = (1.0, 1.0, 1.0, 1.05, 1.2, 1.15, 0.9)
 
-# Planted patterns (probability mass moved from "approved" to the named outcome).
-CO_CARD_DECLINE_SHIFT = 0.06
-CL_CARD_APPROVAL_SHIFT = 0.06
-CAFETAL_APPROVAL_SHIFT = 0.04
-MAGDALENA_DECLINE_SHIFT = 0.06
-MAGDALENA_FAILURE_SHIFT = 0.05
-NIGHT_TIMEOUT_PSP = "psp_norte"
-NIGHT_TIMEOUT_LOCAL_HOURS: tuple[int, ...] = (2, 3, 4)
-NIGHT_TIMEOUT_FAILURE_SHIFT = 0.25
-AMEX_DECLINE_SHIFT = 0.12
-MERCHANT_ISSUE_START_DAY = 60
-UX_ISSUE_EXPIRED_SHIFT_MOBILE_WEB = 0.35
-UX_ISSUE_EXPIRED_SHIFT_OTHER = 0.10
-PROCESSING_ISSUE_PSP = "psp_azteca"
-PROCESSING_ISSUE_DECLINE_SHIFT = 0.30
+# Planted anomalies.
+DECLINE_SPIKE_PSP = "PSP_C"
+DECLINE_SPIKE_COUNTRY = "CO"
+DECLINE_SPIKE_FIRST_DAY = 60
+DECLINE_SPIKE_DAYS = 3
+DECLINE_SPIKE_FACTOR = 2.0
+OXXO_EXPIRY_COUNTRY = "MX"
+OXXO_EXPIRY_MERCHANT_RANK = 2  # third largest Mexican merchant
+OXXO_EXPIRY_OUTCOME: tuple[float, float, float, float, float] = (0.04, 0.0, 0.0, 0.95, 0.01)
+TIMEOUT_SPIKE_PSP = "PSP_B"
+TIMEOUT_SPIKE_COUNTRY = "MX"
+TIMEOUT_SPIKE_EARLIEST_DAY = 66
+TIMEOUT_SPIKE_LOCAL_HOURS: tuple[int, ...] = (2, 3)  # 02:00 to 03:59 local time
+TIMEOUT_SPIKE_FAILURE_SHIFT = 0.60
 
 # Delivery behaviour.
-DELIVERY_LATENCY_MEAN_MS = 2_000.0
-LATE_DELIVERY_SHARE = 0.05
-LATE_DELIVERY_RANGE_MS: tuple[int, int] = (60_000, 48 * 3_600_000)
-DUPLICATE_DELIVERY_SHARE = 0.02
+DUPLICATE_SHARE = 0.01
 DUPLICATE_RETRY_RANGE_MS: tuple[int, int] = (1_000, 6 * 3_600_000)
+OUT_OF_ORDER_SHARE = 0.03
+OUT_OF_ORDER_DELAY_RANGE_MS: tuple[int, int] = (60_000, 48 * 3_600_000)
 
 # Transaction lifecycle timing.
 CARD_RESOLUTION_MEAN_MS = 20_000.0
@@ -153,6 +196,7 @@ REFUND_DELAY_RANGE_MS: tuple[int, int] = (86_400_000, 10 * 86_400_000)
 
 MS_PER_HOUR = 3_600_000
 MS_PER_DAY = 86_400_000
+SNAPSHOT_HOUR_UTC = 6
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S%.3fZ"
 
 
@@ -162,17 +206,38 @@ class GeneratorConfig:
 
     Attributes:
         seed: Seed of the random generator; the same seed always yields the same files.
-        scale: Multiplier on the real volume of 400,000 transactions per 30 days.
-        start_date: First local day of the window.
+        n_transactions: Number of transactions. The default is TiendaMax's real volume of about
+            400,000 per month over 90 days.
+        end_date: Last local day of the window.
         days: Number of local days in the window.
-        output_dir: Directory that receives ``events/`` and ``_manifest.json``.
+        output_dir: Directory that receives the raw files.
     """
 
     seed: int = 42
-    scale: float = 1.0
-    start_date: date = date(2026, 6, 1)
+    n_transactions: int = 1_200_000
+    end_date: date = date(2026, 9, 30)
     days: int = 90
     output_dir: Path = Path("data/raw")
+
+    @property
+    def start_date(self) -> date:
+        """First local day of the window."""
+        return self.end_date - timedelta(days=self.days - 1)
+
+    def day_date(self, day: int) -> date:
+        """Calendar date of a zero based day index within the window."""
+        return self.start_date + timedelta(days=day)
+
+
+@dataclass(frozen=True)
+class _Merchants:
+    """Column arrays with one element per merchant, plus the planted merchant."""
+
+    country: IntArray
+    weight: FloatArray
+    category: IntArray
+    size_tier: list[str]
+    oxxo_expiry_merchant: int
 
 
 @dataclass(frozen=True)
@@ -184,14 +249,11 @@ class _Transactions:
     method: IntArray
     psp: IntArray
     card_brand: IntArray
-    channel: IntArray
     amount_minor: IntArray
     outcome: IntArray
     refunded: BoolArray
-    error_code: IntArray
+    reason: IntArray
     created_ms: IntArray
-    ux_merchant: int
-    processing_merchant: int
 
 
 def _choose(rng: np.random.Generator, shares: Sequence[float], size: int) -> IntArray:
@@ -214,7 +276,9 @@ def _choose_named(
     return picked
 
 
-def _shift(probs: FloatArray, mask: BoolArray, source: int, target: int, delta: float) -> None:
+def _shift(
+    probs: FloatArray, mask: BoolArray, source: int, target: int, delta: float | FloatArray
+) -> None:
     """Move up to ``delta`` probability mass from ``source`` to ``target`` for masked rows."""
     moved = np.minimum(probs[mask, source], delta)
     probs[mask, source] -= moved
@@ -226,95 +290,141 @@ def _uniform_ms(rng: np.random.Generator, bounds: tuple[int, int], size: int) ->
     return rng.integers(bounds[0], bounds[1], size=size, dtype=np.int64)
 
 
+def _utc_offset_hours(config: GeneratorConfig) -> IntArray:
+    """Return the UTC offset in hours per country (rows) and window day (columns).
+
+    The offset is taken at local noon, which is exact except inside the one hour a daylight
+    saving change skips or repeats (Chile changes within the default window).
+    """
+    offsets = np.zeros((len(COUNTRIES), config.days), dtype=np.int64)
+    for country, zone in enumerate(TIME_ZONES):
+        for day in range(config.days):
+            noon = datetime.combine(config.day_date(day), time(12), tzinfo=ZoneInfo(zone))
+            offset = noon.utcoffset()
+            assert offset is not None
+            offsets[country, day] = int(offset.total_seconds() // 3600)
+    return offsets
+
+
+def _timeout_spike_days(config: GeneratorConfig) -> tuple[int, int]:
+    """Return the day indexes of the first Saturday and Sunday of the timeout spike weekend."""
+    saturday = next(
+        day
+        for day in range(min(TIMEOUT_SPIKE_EARLIEST_DAY, config.days - 2), config.days)
+        if config.day_date(day).weekday() == 5
+    )
+    return saturday, saturday + 1
+
+
+def _sample_merchants(rng: np.random.Generator) -> _Merchants:
+    """Sample the merchant dimension with a long tail (lognormal) volume distribution."""
+    country = _choose(rng, COUNTRY_MERCHANT_SHARE, MERCHANT_COUNT)
+    weight = rng.lognormal(mean=0.0, sigma=MERCHANT_VOLUME_SIGMA, size=MERCHANT_COUNT)
+    category = _choose(rng, [1.0] * len(MERCHANT_CATEGORIES), MERCHANT_COUNT)
+
+    rank = np.empty(MERCHANT_COUNT, dtype=np.int64)
+    rank[np.argsort(-weight)] = np.arange(MERCHANT_COUNT)
+    size_tier = [next(name for name, limit in SIZE_TIERS if r < limit) for r in rank.tolist()]
+
+    in_country = np.flatnonzero(country == COUNTRIES.index(OXXO_EXPIRY_COUNTRY))
+    by_volume = in_country[np.argsort(-weight[in_country])]
+    oxxo_expiry_merchant = int(by_volume[min(OXXO_EXPIRY_MERCHANT_RANK, len(by_volume) - 1)])
+    return _Merchants(country, weight, category, size_tier, oxxo_expiry_merchant)
+
+
 def _sample_transactions(
-    rng: np.random.Generator, config: GeneratorConfig, start_ms: int
+    rng: np.random.Generator, config: GeneratorConfig, merchants: _Merchants, start_ms: int
 ) -> _Transactions:
     """Sample every transaction attribute and its final outcome.
 
     Grain: one array element per transaction.
     """
-    n = round(TRANSACTIONS_PER_MONTH * config.days / 30 * config.scale)
+    n = config.n_transactions
+    merchant = _choose(rng, merchants.weight.tolist(), n)
+    country = merchants.country[merchant]
 
-    merchant_country = _choose(rng, COUNTRY_MERCHANT_SHARE, MERCHANT_COUNT)
-    merchant_weight = rng.lognormal(mean=0.0, sigma=1.5, size=MERCHANT_COUNT)
-    merchant = _choose(rng, merchant_weight.tolist(), n)
-    country = merchant_country[merchant]
-
-    def largest_merchant(country_name: str) -> int:
-        in_country = merchant_country == COUNTRIES.index(country_name)
-        return int(np.argmax(np.where(in_country, merchant_weight, -1.0)))
-
-    ux_merchant = largest_merchant("CL")
-    processing_merchant = largest_merchant("MX")
-
-    day = rng.integers(0, config.days, size=n, dtype=np.int64)
+    weekday = np.asarray([config.day_date(day).weekday() for day in range(config.days)])
+    day = _choose(rng, np.asarray(WEEKDAY_WEIGHTS)[weekday].tolist(), n)
     local_hour = _choose(rng, HOUR_WEIGHTS, n)
     local_ms = day * MS_PER_DAY + local_hour * MS_PER_HOUR + _uniform_ms(rng, (0, MS_PER_HOUR), n)
-    offset_ms = np.asarray(UTC_OFFSET_HOURS, dtype=np.int64)[country] * MS_PER_HOUR
-    created_ms = start_ms + local_ms - offset_ms
+    created_ms = start_ms + local_ms - _utc_offset_hours(config)[country, day] * MS_PER_HOUR
 
     method = np.zeros(n, dtype=np.int64)
-    psp = np.zeros(n, dtype=np.int64)
     for code, name in enumerate(COUNTRIES):
         in_country = country == code
-        size = int(in_country.sum())
-        method[in_country] = _choose_named(rng, METHOD_MIX[name], METHODS, size)
-        psp[in_country] = _choose_named(rng, PSP_MIX[name], PSPS, size)
-    co_after_launch = (country == COUNTRIES.index("CO")) & (day >= CO_NEW_PSP_LAUNCH_DAY)
-    psp[co_after_launch] = _choose_named(
-        rng, CO_PSP_MIX_AFTER_LAUNCH, PSPS, int(co_after_launch.sum())
+        method[in_country] = _choose_named(rng, METHOD_MIX[name], METHODS, int(in_country.sum()))
+    psp = _choose_named(rng, PSP_MIX, PSPS, n)
+    new_psps_live = (country == COUNTRIES.index(NEW_PSP_COUNTRY)) & (
+        day >= config.days - NEW_PSP_LIVE_DAYS
     )
+    psp[new_psps_live] = _choose_named(rng, CO_PSP_MIX_AFTER_LAUNCH, PSPS, int(new_psps_live.sum()))
 
-    is_card = method == METHODS.index("card")
+    is_card = method == METHODS.index(CARD_METHOD)
     card_brand = np.where(is_card, _choose(rng, CARD_BRAND_SHARE, n), -1)
-    channel = _choose(rng, CHANNEL_SHARE, n)
 
     major = np.asarray(MEDIAN_AMOUNT_MAJOR)[country] * rng.lognormal(0.0, AMOUNT_SIGMA, size=n)
     whole_major = np.maximum(np.rint(major), 1.0).astype(np.int64)
     cents = np.where(country == COUNTRIES.index("MX"), rng.integers(0, 100, size=n), 0)
-    minor_per_major = np.asarray(MINOR_PER_MAJOR, dtype=np.int64)[country]
-    amount_minor = whole_major * minor_per_major + cents
+    amount_minor = whole_major * np.asarray(MINOR_PER_MAJOR, dtype=np.int64)[country] + cents
 
+    # Segment effects: authorization differs by country, brand and PSP.
     probs = np.asarray([BASE_OUTCOME[name] for name in METHODS], dtype=np.float64)[method]
-    late_window = day >= MERCHANT_ISSUE_START_DAY
+    in_co = country == COUNTRIES.index("CO")
+    in_cl = country == COUNTRIES.index("CL")
+    _shift(probs, is_card & in_co, APPROVED, DECLINED, CO_CARD_DECLINE_SHIFT)
+    _shift(probs, is_card & in_cl, DECLINED, APPROVED, CL_CARD_APPROVAL_SHIFT)
     _shift(
-        probs, is_card & (country == COUNTRIES.index("CO")), APPROVED, DECLINED,
-        CO_CARD_DECLINE_SHIFT,
+        probs, card_brand == CARD_BRANDS.index("mastercard"), APPROVED, DECLINED,
+        MASTERCARD_DECLINE_SHIFT,
     )  # fmt: skip
-    _shift(
-        probs, is_card & (country == COUNTRIES.index("CL")), DECLINED, APPROVED,
-        CL_CARD_APPROVAL_SHIFT,
-    )  # fmt: skip
-    _shift(probs, psp == PSPS.index("psp_cafetal"), DECLINED, APPROVED, CAFETAL_APPROVAL_SHIFT)
-    in_magdalena = psp == PSPS.index("psp_magdalena")
-    _shift(probs, in_magdalena, APPROVED, DECLINED, MAGDALENA_DECLINE_SHIFT)
-    _shift(probs, in_magdalena, APPROVED, FAILED, MAGDALENA_FAILURE_SHIFT)
-    night_timeout = (psp == PSPS.index(NIGHT_TIMEOUT_PSP)) & np.isin(
-        local_hour, NIGHT_TIMEOUT_LOCAL_HOURS
+    on_psp_b = psp == PSPS.index("PSP_B")
+    _shift(probs, on_psp_b & ~in_cl, APPROVED, DECLINED, PSP_B_DECLINE_SHIFT)
+    _shift(probs, on_psp_b & in_cl, DECLINED, APPROVED, PSP_B_CL_APPROVAL_SHIFT)
+    _shift(probs, psp == PSPS.index("PSP_C"), DECLINED, APPROVED, PSP_C_APPROVAL_SHIFT)
+    on_psp_d = psp == PSPS.index("PSP_D")
+    _shift(probs, on_psp_d, APPROVED, DECLINED, PSP_D_DECLINE_SHIFT)
+    _shift(probs, on_psp_d, APPROVED, FAILED, PSP_D_FAILURE_SHIFT)
+
+    # Planted anomaly a: the decline rate doubles for PSP_C card transactions in Colombia.
+    decline_spike = (
+        (psp == PSPS.index(DECLINE_SPIKE_PSP))
+        & (country == COUNTRIES.index(DECLINE_SPIKE_COUNTRY))
+        & is_card
+        & (day >= DECLINE_SPIKE_FIRST_DAY)
+        & (day < DECLINE_SPIKE_FIRST_DAY + DECLINE_SPIKE_DAYS)
     )
-    _shift(probs, night_timeout, APPROVED, FAILED, NIGHT_TIMEOUT_FAILURE_SHIFT)
-    _shift(probs, card_brand == CARD_BRANDS.index("amex"), APPROVED, DECLINED, AMEX_DECLINE_SHIFT)
-    ux_issue = (merchant == ux_merchant) & late_window
-    on_mobile_web = channel == CHANNELS.index("mobile_web")
-    _shift(probs, ux_issue & on_mobile_web, APPROVED, EXPIRED, UX_ISSUE_EXPIRED_SHIFT_MOBILE_WEB)
-    _shift(probs, ux_issue & ~on_mobile_web, APPROVED, EXPIRED, UX_ISSUE_EXPIRED_SHIFT_OTHER)
-    processing_issue = (
-        (merchant == processing_merchant)
-        & late_window
-        & (psp == PSPS.index(PROCESSING_ISSUE_PSP))
-    )  # fmt: skip
-    _shift(probs, processing_issue, APPROVED, DECLINED, PROCESSING_ISSUE_DECLINE_SHIFT)
+    extra_declines = probs[decline_spike, DECLINED] * (DECLINE_SPIKE_FACTOR - 1.0)
+    _shift(probs, decline_spike, APPROVED, DECLINED, extra_declines)
+    # Planted anomaly b: one Mexican merchant whose OXXO vouchers almost always expire.
+    oxxo_expiry = (merchant == merchants.oxxo_expiry_merchant) & (
+        method == METHODS.index(VOUCHER_METHOD)
+    )
+    probs[oxxo_expiry] = OXXO_EXPIRY_OUTCOME
+    # Planted anomaly c: network timeouts for one PSP during the night of one weekend.
+    timeout_spike = (
+        (psp == PSPS.index(TIMEOUT_SPIKE_PSP))
+        & (country == COUNTRIES.index(TIMEOUT_SPIKE_COUNTRY))
+        & np.isin(day, _timeout_spike_days(config))
+        & np.isin(local_hour, TIMEOUT_SPIKE_LOCAL_HOURS)
+    )
+    _shift(probs, timeout_spike, APPROVED, FAILED, TIMEOUT_SPIKE_FAILURE_SHIFT)
 
     thresholds = probs.cumsum(axis=1)[:, :4]
     outcome = (rng.random(n)[:, None] > thresholds).sum(axis=1).astype(np.int64)
     refunded = (outcome == APPROVED) & (rng.random(n) < REFUND_SHARE_OF_APPROVED)
 
-    decline_code = _choose(rng, DECLINE_CODE_SHARE, n)
-    failure_code = _choose(rng, FAILURE_CODE_SHARE, n) + len(DECLINE_CODES)
-    failure_code[night_timeout] = ERROR_CODES.index("psp_timeout")
-    error_code = np.where(
-        outcome == DECLINED, decline_code, np.where(outcome == FAILED, failure_code, -1)
+    decline_reason = np.where(
+        is_card,
+        _choose_named(rng, CARD_DECLINE_REASONS, REASONS, n),
+        _choose_named(rng, OTHER_DECLINE_REASONS, REASONS, n),
     )
+    failure_reason = _choose_named(rng, FAILURE_REASONS, REASONS, n)
+    failure_reason[timeout_spike] = REASONS.index("network_timeout")
+    reason = np.select(
+        [outcome == DECLINED, outcome == FAILED, outcome == EXPIRED],
+        [decline_reason, failure_reason, REASONS.index("expired")],
+        default=-1,
+    ).astype(np.int64)
 
     return _Transactions(
         merchant=merchant,
@@ -322,23 +432,12 @@ def _sample_transactions(
         method=method,
         psp=psp,
         card_brand=card_brand,
-        channel=channel,
         amount_minor=amount_minor,
         outcome=outcome,
         refunded=refunded,
-        error_code=error_code,
+        reason=reason,
         created_ms=created_ms,
-        ux_merchant=ux_merchant,
-        processing_merchant=processing_merchant,
     )
-
-
-def _delivery_latency(rng: np.random.Generator, size: int) -> tuple[IntArray, BoolArray]:
-    """Sample webhook delivery latency and flag the late deliveries."""
-    latency = rng.exponential(DELIVERY_LATENCY_MEAN_MS, size=size).astype(np.int64)
-    late = rng.random(size) < LATE_DELIVERY_SHARE
-    latency = latency + np.where(late, _uniform_ms(rng, LATE_DELIVERY_RANGE_MS, size), 0)
-    return latency, late
 
 
 def _names(column: str, vocabulary: Sequence[str]) -> pl.Expr:
@@ -358,40 +457,114 @@ def _timestamp(column: str) -> pl.Expr:
     return pl.from_epoch(pl.col(column), time_unit="ms").dt.strftime(TIMESTAMP_FORMAT)
 
 
-def generate(config: GeneratorConfig) -> dict[str, Any]:
-    """Generate the raw webhook deliveries and the ground truth manifest.
+def _merchant_id(code: int) -> str:
+    """Format a merchant index as its public identifier."""
+    return f"mrc_{code:03d}"
 
-    Any existing ``events`` directory under ``config.output_dir`` is replaced.
+
+def _write_reference_files(config: GeneratorConfig, merchants: _Merchants) -> None:
+    """Write ``merchants.csv``, ``psp_fees.csv`` and ``planted_anomalies.json``."""
+    pl.DataFrame(
+        {
+            "merchant_id": [_merchant_id(code) for code in range(MERCHANT_COUNT)],
+            "country": [COUNTRIES[code] for code in merchants.country.tolist()],
+            "category": [MERCHANT_CATEGORIES[code] for code in merchants.category.tolist()],
+            "size_tier": merchants.size_tier,
+        }
+    ).write_csv(config.output_dir / MERCHANTS_FILE)
+
+    fees = [
+        {
+            "psp": psp,
+            "country": country,
+            "payment_method": method,
+            "pct_fee": round(PSP_PCT_FEE[psp] + METHOD_PCT_FEE_ADJUSTMENT[method], 2),
+            "fixed_fee_usd": PSP_FIXED_FEE_USD[psp],
+        }
+        for psp in PSPS
+        for country in COUNTRIES
+        if psp not in NEW_PSPS or country == NEW_PSP_COUNTRY
+        for method, _ in METHOD_MIX[country]
+    ]
+    pl.DataFrame(fees).write_csv(config.output_dir / PSP_FEES_FILE)
+
+    spike_first = config.day_date(DECLINE_SPIKE_FIRST_DAY)
+    saturday, sunday = (config.day_date(day) for day in _timeout_spike_days(config))
+    planted = {
+        "window": {
+            "start_date": config.start_date.isoformat(),
+            "end_date": config.end_date.isoformat(),
+            "new_psps": list(NEW_PSPS),
+            "new_psp_country": NEW_PSP_COUNTRY,
+            "new_psp_first_date": config.day_date(config.days - NEW_PSP_LIVE_DAYS).isoformat(),
+        },
+        "anomalies": [
+            {
+                "id": "a",
+                "type": "decline_rate_spike",
+                "description": "The decline rate doubles for 3 consecutive local days.",
+                "psp": DECLINE_SPIKE_PSP,
+                "country": DECLINE_SPIKE_COUNTRY,
+                "payment_method": CARD_METHOD,
+                "start_date": spike_first.isoformat(),
+                "end_date": (spike_first + timedelta(days=DECLINE_SPIKE_DAYS - 1)).isoformat(),
+                "decline_rate_factor": DECLINE_SPIKE_FACTOR,
+            },
+            {
+                "id": "b",
+                "type": "voucher_expiration",
+                "description": "One merchant whose OXXO vouchers expire about 95% of the time.",
+                "merchant_id": _merchant_id(merchants.oxxo_expiry_merchant),
+                "country": OXXO_EXPIRY_COUNTRY,
+                "payment_method": VOUCHER_METHOD,
+                "expected_expiration_rate": OXXO_EXPIRY_OUTCOME[EXPIRED],
+            },
+            {
+                "id": "c",
+                "type": "network_timeout_spike",
+                "description": "network_timeout failures between 02:00 and 04:00 local time.",
+                "psp": TIMEOUT_SPIKE_PSP,
+                "country": TIMEOUT_SPIKE_COUNTRY,
+                "dates": [saturday.isoformat(), sunday.isoformat()],
+                "local_hours": list(TIMEOUT_SPIKE_LOCAL_HOURS),
+                "decline_reason": "network_timeout",
+                "added_failure_probability": TIMEOUT_SPIKE_FAILURE_SHIFT,
+            },
+        ],
+    }
+    (config.output_dir / PLANTED_ANOMALIES_FILE).write_text(json.dumps(planted, indent=2) + "\n")
+
+
+def generate(config: GeneratorConfig) -> dict[str, Any]:
+    """Generate the raw files described in the module docstring, replacing existing ones.
 
     Args:
-        config: Seed, scale, window and output directory of the run.
+        config: Seed, transaction count, window and output directory of the run.
 
     Returns:
-        The manifest that was written to ``_manifest.json``: run parameters, delivery, event and
-        transaction counts, observed status counts and the planted patterns.
+        A ground truth summary computed per transaction, independently of the written file:
+        ``n_transactions``, ``n_events_unique``, ``n_duplicate_deliveries``, ``n_deliveries``,
+        ``n_out_of_order_deliveries`` and ``status_counts`` (latest status per transaction).
 
     Raises:
-        ValueError: If ``config.scale`` or ``config.days`` is not positive.
+        ValueError: If ``config.n_transactions`` or ``config.days`` is not positive.
     """
-    if config.scale <= 0 or config.days <= 0:
-        raise ValueError("scale and days must be positive")
+    if config.n_transactions <= 0 or config.days <= 0:
+        raise ValueError("n_transactions and days must be positive")
 
     rng = np.random.default_rng(config.seed)
-    start = datetime(
-        config.start_date.year, config.start_date.month, config.start_date.day, tzinfo=UTC
-    )
-    start_ms = int(start.timestamp() * 1000)
-    snapshot_ms = start_ms + config.days * MS_PER_DAY
+    start_ms = int(datetime.combine(config.start_date, time(0), tzinfo=UTC).timestamp() * 1000)
+    snapshot_ms = start_ms + config.days * MS_PER_DAY + SNAPSHOT_HOUR_UTC * MS_PER_HOUR
 
-    txn = _sample_transactions(rng, config, start_ms)
-    n = len(txn.outcome)
+    merchants = _sample_merchants(rng)
+    txn = _sample_transactions(rng, config, merchants, start_ms)
+    n = config.n_transactions
 
     # Lifecycle: every transaction emits "pending"; resolved ones emit a final event; some
-    # approved ones emit "refunded" later.
-    is_card = txn.method == METHODS.index("card")
+    # approved ones emit "refunded" later. Events after the snapshot are not emitted.
     is_voucher = txn.method == METHODS.index(VOUCHER_METHOD)
     resolution = np.where(
-        is_card,
+        txn.method == METHODS.index(CARD_METHOD),
         rng.exponential(CARD_RESOLUTION_MEAN_MS, size=n),
         rng.exponential(OTHER_RESOLUTION_MEAN_MS, size=n),
     ).astype(np.int64)
@@ -405,44 +578,37 @@ def generate(config: GeneratorConfig) -> dict[str, Any]:
     )
     final_ms = txn.created_ms + resolution + 1
     refund_ms = final_ms + _uniform_ms(rng, REFUND_DELAY_RANGE_MS, n)
+    final_emitted = (txn.outcome != PENDING) & (final_ms < snapshot_ms)
+    refund_emitted = txn.refunded & final_emitted & (refund_ms < snapshot_ms)
 
     kinds: tuple[tuple[BoolArray, IntArray, IntArray], ...] = (
         (np.ones(n, dtype=np.bool_), np.full(n, PENDING, dtype=np.int64), txn.created_ms),
-        (txn.outcome != PENDING, txn.outcome, final_ms),
-        (txn.refunded, np.full(n, REFUNDED, dtype=np.int64), refund_ms),
+        (final_emitted, txn.outcome, final_ms),
+        (refund_emitted, np.full(n, REFUNDED, dtype=np.int64), refund_ms),
     )
-    kept_by_kind: list[BoolArray] = []
-    parts: list[tuple[IntArray, IntArray, IntArray, IntArray, BoolArray]] = []
-    for exists, status, occurred_ms in kinds:
-        latency, late = _delivery_latency(rng, n)
-        received_ms = occurred_ms + latency
-        kept = exists & (received_ms < snapshot_ms)
-        kept_by_kind.append(kept)
-        index = np.flatnonzero(kept)
-        parts.append((index, status[index], occurred_ms[index], received_ms[index], late[index]))
-
-    txn_index = np.concatenate([part[0] for part in parts])
-    status = np.concatenate([part[1] for part in parts])
-    occurred = np.concatenate([part[2] for part in parts])
-    received = np.concatenate([part[3] for part in parts])
-    late_flags = np.concatenate([part[4] for part in parts])
+    indexes = [np.flatnonzero(emitted) for emitted, _, _ in kinds]
+    txn_index = np.concatenate(indexes)
+    status = np.concatenate([codes[i] for (_, codes, _), i in zip(kinds, indexes, strict=True)])
+    event_ms = np.concatenate([at[i] for (_, _, at), i in zip(kinds, indexes, strict=True)])
     n_events = len(txn_index)
     # Shuffled so that identifiers carry no ordering information.
     event_number = rng.permutation(n_events).astype(np.int64)
 
-    duplicate_received = received + _uniform_ms(rng, DUPLICATE_RETRY_RANGE_MS, n_events)
-    duplicated = (rng.random(n_events) < DUPLICATE_DELIVERY_SHARE) & (
-        duplicate_received < snapshot_ms
+    # Arrival order: a few events are delivered late (out of order) and a few are repeated.
+    delayed = rng.random(n_events) < OUT_OF_ORDER_SHARE
+    arrival_ms = event_ms + np.where(
+        delayed, _uniform_ms(rng, OUT_OF_ORDER_DELAY_RANGE_MS, n_events), 0
     )
-    dup = np.flatnonzero(duplicated)
+    dup = np.flatnonzero(rng.random(n_events) < DUPLICATE_SHARE)
+    dup_arrival_ms = arrival_ms[dup] + _uniform_ms(rng, DUPLICATE_RETRY_RANGE_MS, len(dup))
 
     deliveries = pl.DataFrame(
         {
             "event_number": np.concatenate([event_number, event_number[dup]]),
             "txn_index": np.concatenate([txn_index, txn_index[dup]]),
             "status_code": np.concatenate([status, status[dup]]),
-            "occurred_ms": np.concatenate([occurred, occurred[dup]]),
-            "received_ms": np.concatenate([received, duplicate_received[dup]]),
+            "event_ms": np.concatenate([event_ms, event_ms[dup]]),
+            "arrival_ms": np.concatenate([arrival_ms, dup_arrival_ms]),
         }
     )
     transactions = pl.DataFrame(
@@ -453,100 +619,66 @@ def generate(config: GeneratorConfig) -> dict[str, Any]:
             "method_code": txn.method,
             "psp_code": txn.psp,
             "card_brand_code": txn.card_brand,
-            "channel_code": txn.channel,
             "amount_minor": txn.amount_minor,
-            "error_code_index": txn.error_code,
+            "reason_code": txn.reason,
+            "created_ms": txn.created_ms,
         }
     )
-    carries_error = pl.col("status_code").is_in([DECLINED, FAILED])
-    frame = (
+    carries_reason = pl.col("status_code").is_in([DECLINED, FAILED, EXPIRED])
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    (
         deliveries.lazy()
         .join(transactions.lazy(), on="txn_index", how="inner")
-        .sort("received_ms", "event_number")
+        .sort("arrival_ms", "event_number")
         .select(
-            pl.from_epoch(pl.col("received_ms"), time_unit="ms").dt.date().alias("received_date"),
             _prefixed_id("evt", "event_number", 10).alias("event_id"),
             _prefixed_id("txn", "txn_index", 9).alias("transaction_id"),
-            _prefixed_id("mrc", "merchant_code", 5).alias("merchant_id"),
+            _prefixed_id("mrc", "merchant_code", 3).alias("merchant_id"),
             _names("country_code", COUNTRIES).alias("country"),
             _names("country_code", CURRENCIES).alias("currency"),
             pl.col("amount_minor"),
             _names("method_code", METHODS).alias("payment_method"),
-            _names("psp_code", PSPS).alias("psp"),
             _names("card_brand_code", CARD_BRANDS).alias("card_brand"),
-            _names("channel_code", CHANNELS).alias("channel"),
+            _names("psp_code", PSPS).alias("psp"),
             _names("status_code", STATUSES).alias("status"),
-            pl.when(carries_error)
-            .then(_names("error_code_index", ERROR_CODES))
+            pl.when(carries_reason)
+            .then(_names("reason_code", REASONS))
             .otherwise(None)
-            .alias("error_code"),
-            _timestamp("occurred_ms").alias("occurred_at"),
-            _timestamp("received_ms").alias("received_at"),
+            .alias("decline_reason"),
+            _timestamp("created_ms").alias("created_at"),
+            _timestamp("event_ms").alias("event_at"),
         )
         .collect()
+        .write_ndjson(config.output_dir / WEBHOOKS_FILE)
     )
+    _write_reference_files(config, merchants)
 
-    events_dir = config.output_dir / "events"
-    if events_dir.exists():
-        shutil.rmtree(events_dir)
-    partitions = frame.partition_by(
-        "received_date", maintain_order=True, include_key=False, as_dict=True
-    )
-    for (received_date,), partition in partitions.items():
-        partition_dir = events_dir / f"received_date={received_date}"
-        partition_dir.mkdir(parents=True)
-        partition.write_ndjson(partition_dir / "events.jsonl")
-
-    # Ground truth computed at transaction level, independently of the delivery frame.
-    pending_kept, final_kept, refund_kept = kept_by_kind
-    observed = np.where(
-        refund_kept,
-        REFUNDED,
-        np.where(final_kept, txn.outcome, np.where(pending_kept, PENDING, -1)),
-    )
-    manifest: dict[str, Any] = {
-        "seed": config.seed,
-        "scale": config.scale,
-        "start_date": config.start_date.isoformat(),
-        "days": config.days,
-        "snapshot_at": (start + timedelta(days=config.days)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "n_transactions_generated": n,
-        "n_transactions": int((observed >= 0).sum()),
+    observed = np.where(refund_emitted, REFUNDED, np.where(final_emitted, txn.outcome, PENDING))
+    summary: dict[str, Any] = {
+        "n_transactions": n,
         "n_events_unique": n_events,
         "n_duplicate_deliveries": len(dup),
         "n_deliveries": n_events + len(dup),
-        "n_late_events": int(late_flags.sum()),
-        "n_partitions": len(partitions),
+        "n_out_of_order_deliveries": int(delayed.sum()),
         "status_counts": {
             name: int((observed == code).sum()) for code, name in enumerate(STATUSES)
         },
-        "planted": {
-            "co_new_psps": ["psp_cafetal", "psp_magdalena"],
-            "co_new_psp_launch_date": (
-                config.start_date + timedelta(days=CO_NEW_PSP_LAUNCH_DAY)
-            ).isoformat(),
-            "merchant_issue_start_date": (
-                config.start_date + timedelta(days=MERCHANT_ISSUE_START_DAY)
-            ).isoformat(),
-            "ux_issue_merchant_id": f"mrc_{txn.ux_merchant:05d}",
-            "processing_issue_merchant_id": f"mrc_{txn.processing_merchant:05d}",
-            "processing_issue_psp": PROCESSING_ISSUE_PSP,
-            "night_timeout_psp": NIGHT_TIMEOUT_PSP,
-            "night_timeout_local_hours": list(NIGHT_TIMEOUT_LOCAL_HOURS),
-            "high_decline_card_brand": "amex",
-        },
     }
-    (config.output_dir / "_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    shares = " ".join(f"{name}={count / n:.1%}" for name, count in summary["status_counts"].items())
     logger.info(
-        "generation finished transactions=%d unique_events=%d deliveries=%d duplicates=%d "
-        "partitions=%d",
-        manifest["n_transactions"],
-        manifest["n_events_unique"],
-        manifest["n_deliveries"],
-        manifest["n_duplicate_deliveries"],
-        manifest["n_partitions"],
+        "generation finished window=%s..%s transactions=%d unique_events=%d deliveries=%d "
+        "duplicates=%d delayed=%d output_dir=%s",
+        config.start_date,
+        config.end_date,
+        n,
+        n_events,
+        summary["n_deliveries"],
+        len(dup),
+        summary["n_out_of_order_deliveries"],
+        config.output_dir,
     )
-    return manifest
+    logger.info("final status mix %s", shares)
+    return summary
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -564,16 +696,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     defaults = GeneratorConfig()
     parser = argparse.ArgumentParser(description="Generate synthetic Yuno webhook events.")
     parser.add_argument("--seed", type=int, default=defaults.seed)
-    parser.add_argument("--scale", type=float, default=defaults.scale)
-    parser.add_argument("--start-date", type=date.fromisoformat, default=defaults.start_date)
+    parser.add_argument("--transactions", type=int, default=defaults.n_transactions)
+    parser.add_argument("--end-date", type=date.fromisoformat, default=defaults.end_date)
     parser.add_argument("--days", type=int, default=defaults.days)
     parser.add_argument("--output-dir", type=Path, default=defaults.output_dir)
     args = parser.parse_args(argv)
     generate(
         GeneratorConfig(
             seed=args.seed,
-            scale=args.scale,
-            start_date=args.start_date,
+            n_transactions=args.transactions,
+            end_date=args.end_date,
             days=args.days,
             output_dir=args.output_dir,
         )

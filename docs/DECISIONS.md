@@ -28,37 +28,43 @@ root user, and the healthcheck is written in Python because slim images have no 
 
 ## D4. Synthetic raw data
 
-`data_gen/generate.py` plays the upstream system and shares no code with the pipeline; the JSON
-contract is the only interface.
+`data_gen/generate.py` plays the upstream system and shares no code with the pipeline; the file
+contract is the only interface. This replaces the first generator design (see the worklog).
 
-- **Grain**: one JSON object per webhook delivery, newline delimited, partitioned by arrival date
-  (`data/raw/events/received_date=YYYY-MM-DD/events.jsonl`). An `event_id` can repeat.
-- **Fields**: `event_id`, `transaction_id`, `merchant_id`, `country`, `currency`, `amount_minor`,
-  `payment_method`, `psp`, `card_brand`, `channel`, `status`, `error_code`, `occurred_at` (event
-  time) and `received_at` (arrival time), both ISO 8601 UTC.
-- **Lifecycle**: every transaction emits `pending`; resolved ones emit `approved`, `declined`,
-  `failed` or `expired`; 3% of approved ones later emit `refunded` (full refunds only).
-- **Volume**: 90 local days from 2026-06-01 at 400,000 transactions per 30 days (`--scale` shrinks
-  it). Seeded, so the same seed yields byte identical files.
-- **Snapshot**: deliveries arriving after the end of the window are dropped, so recent transactions
+- **`data/raw/webhooks.jsonl`**: grain is one row per webhook delivery, which is one event per
+  status change plus about 1% repeated deliveries of the same `event_id`. Fields: `event_id`,
+  `transaction_id`, `merchant_id`, `country`, `currency`, `amount_minor`, `payment_method`,
+  `card_brand`, `psp`, `status`, `decline_reason`, `created_at`, `event_at` (ISO 8601 UTC).
+- **`data/raw/merchants.csv`**: 120 merchants with `country`, `category` and `size_tier`
+  (enterprise: top 10 by volume, mid: next 30, small: the rest). Volume is lognormal, so the top
+  10 merchants carry more than 40% of the transactions.
+- **`data/raw/psp_fees.csv`**: one row per PSP, country and payment method. `pct_fee` is a
+  percentage of the amount (2.9 means 2.9%) and `fixed_fee_usd` is charged per transaction.
+- **`data/raw/planted_anomalies.json`**: ground truth for the three planted anomalies.
+- **Cards**: one payment method `card` with `card_brand` visa or mastercard, so a method level
+  view is not split by brand while brand stays available as a dimension.
+- **PSPs**: PSP_A and PSP_B serve every country for the whole window; PSP_C and PSP_D serve
+  Colombia only, for the last 45 days. Authorization differs by country, brand and PSP.
+- **Lifecycle**: every transaction emits `pending` (`event_at` equals `created_at`); resolved ones
+  emit `approved`, `declined`, `failed` or `expired`; 2% of approved ones later emit `refunded`
+  (full refunds only). `decline_reason` is set on declined, failed and expired events.
+- **Window**: the 90 local days ending on a fixed date, 2026-09-30. "The last 90 days" is pinned
+  rather than read from the clock so the same seed always yields byte identical files.
+- **Snapshot**: status changes after 2026-10-01 06:00 UTC are not emitted, so recent transactions
   can still be `pending` and OXXO vouchers created in the last 72 hours are unresolved.
-- **Delivery defects**: 5% of events arrive late (1 minute to 48 hours), which produces out of
-  order arrival; 2% of deliveries are repeated with the same `event_id` and a later `received_at`.
-- **Planted patterns** (also written to `data/raw/_manifest.json`, so the analysis can be checked
-  against ground truth): per country method baselines; two Colombian PSPs launched on 2026-07-16,
-  `psp_cafetal` better and `psp_magdalena` worse than the incumbent `psp_andes`; from 2026-07-31 the
-  largest Chilean merchant has an abandonment spike (UX) and the largest Mexican merchant a decline
-  spike on `psp_azteca` (processing); `psp_norte` times out between 02:00 and 04:59 local time;
-  amex cards decline more.
-- **Trade off**: local time in the generator uses fixed UTC offsets, valid for June to August.
-  The pipeline will use IANA time zones, which keeps the two code paths independent.
+- **Arrival order**: line order is arrival order. 3% of events are delivered 1 minute to 48 hours
+  late, so a `pending` event can appear after the final status of its transaction.
+- **Local time**: offsets come from the IANA time zones per day, because Chile changes to daylight
+  saving time on 2026-09-06, inside the window.
 
 ## D5. Full scale by default
 
-The generator defaults to the real volume (about 1.2 million transactions over 90 days) so the
-numbers a reviewer sees match the brief of 400,000 transactions per month.
+The generator defaults to 1,200,000 transactions (TiendaMax's real 400,000 per month over 90 days),
+well above the required minimum of 55,000. `--transactions` shrinks it.
 
-Trade off: a full scale run peaks at about 1.7 GB of memory and writes about 805 MB of raw files,
-which can exhaust a Docker VM limited to 2 GB. Reviewers on a small VM can pass `--scale` (for
-example `--scale 0.25`) to shrink the dataset; every rate keeps its sample size and Wilson interval,
-so a smaller run stays honest about its precision.
+Why: the planted night time anomaly covers two hours of one weekend for one PSP. At 55,000
+transactions that window holds about 5 transactions, too few to detect anything; at full scale it
+holds 122. Small segments need real volume to be readable.
+
+Trade off: a full scale run takes about 2 seconds but peaks at about 1.5 GB of memory and writes a
+780 MB raw file, which can exhaust a Docker VM limited to 2 GB.

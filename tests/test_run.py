@@ -1,24 +1,68 @@
-"""Smoke tests for the pipeline runner.
+"""Tests for the pipeline runner.
 
-Purpose: confirm the CLI entry point runs every stage in the documented order.
-Inputs: none (the stages are stubs and touch no data).
+Purpose: confirm the runner executes every stage in order and generates raw data only when it is
+    missing.
+Inputs: a small generated dataset in a temporary directory.
 Outputs: pytest assertions.
 """
 
 import logging
+from pathlib import Path
 
 import pytest
 
-from pipeline.run import STAGES, main
+from data_gen.generate import RAW_FILES, GeneratorConfig
+from pipeline.run import STAGES, run_pipeline
+
+SMALL = GeneratorConfig(n_transactions=500)
 
 
-def test_main_returns_zero_and_logs_stages_in_order(caplog: pytest.LogCaptureFixture) -> None:
-    """The runner exits with 0 and logs one line per stage, in pipeline order."""
+def _logged_stages(caplog: pytest.LogCaptureFixture) -> list[tuple[str, str]]:
+    """Return (stage, status) pairs in log order, keeping the last status of each stage."""
+    last: dict[str, str] = {}
+    for record in caplog.records:
+        message = record.getMessage()
+        for stage in STAGES:
+            if message.startswith(f"stage={stage} "):
+                last[stage] = message.split("status=")[1].split(" ")[0]
+    return list(last.items())
+
+
+def test_generates_raw_data_when_missing(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The first run writes every raw file and logs the stages in pipeline order."""
     with caplog.at_level(logging.INFO, logger="pipeline.run"):
-        exit_code = main([])
+        run_pipeline(tmp_path, SMALL)
 
-    assert exit_code == 0
-    logged_stages = [
-        stage for record in caplog.records for stage in STAGES if f"stage={stage}" in record.message
+    for name in RAW_FILES:
+        assert (tmp_path / "raw" / name).is_file()
+    assert _logged_stages(caplog) == [
+        ("generate", "done"),
+        ("ingest", "skipped"),
+        ("transform", "skipped"),
+        ("quality", "skipped"),
     ]
-    assert logged_stages == ["generate", "ingest", "transform", "quality"]
+
+
+def test_skips_generation_when_raw_data_exists(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A second run leaves the existing raw files untouched."""
+    run_pipeline(tmp_path, SMALL)
+    webhooks = tmp_path / "raw" / "webhooks.jsonl"
+    before = (webhooks.stat().st_mtime_ns, webhooks.read_bytes())
+
+    with caplog.at_level(logging.INFO, logger="pipeline.run"):
+        run_pipeline(tmp_path, GeneratorConfig(n_transactions=900, seed=7))
+
+    assert (webhooks.stat().st_mtime_ns, webhooks.read_bytes()) == before
+    assert _logged_stages(caplog)[0] == ("generate", "skipped")
+
+
+def test_regenerates_when_one_raw_file_is_missing(tmp_path: Path) -> None:
+    """Removing any raw file triggers a fresh generation."""
+    run_pipeline(tmp_path, SMALL)
+    (tmp_path / "raw" / "psp_fees.csv").unlink()
+
+    run_pipeline(tmp_path, SMALL)
+
+    assert (tmp_path / "raw" / "psp_fees.csv").is_file()
