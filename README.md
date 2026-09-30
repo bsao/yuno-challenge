@@ -44,4 +44,4 @@ make check
 
 ## Status
 
-Scaffold only: the pipeline stages and the dashboard views are stubs.
+The synthetic generator works (`make data`); the pipeline stages and the dashboard views are stubs.
